@@ -1668,9 +1668,6 @@ public class ReliableSocket extends Socket
             _sock.send(packet);
         }
         catch (IOException xcp) {
-            if (!isClosed()) {
-                xcp.printStackTrace();
-            }
         }
     }
 
