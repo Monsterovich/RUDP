@@ -42,8 +42,8 @@
     </target>
 
     <target name="make" depends="init">
-        <javac source="1.5" 
-               target="1.5" 
+        <javac source="1.8" 
+               target="1.8" 
                srcdir="src" 
                destdir="${classes.dir}" 
                debug="on" 
