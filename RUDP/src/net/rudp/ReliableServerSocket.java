@@ -144,7 +144,7 @@ public class ReliableServerSocket extends ServerSocket
         _serverSock = sock;
         _backlogSize = (backlog <= 0) ? DEFAULT_BACKLOG_SIZE : backlog;
         _backlog = new ArrayList<ReliableSocket>(_backlogSize);
-        _clientSockTable = new HashMap<SocketAddress, ReliableClientSocket>();
+        _clientSockTable = new HashMap<SocketAddress, PacketSink>();
         _stateListener = new StateListener();
         _timeout = 0;
         _closed = false;
@@ -260,21 +260,69 @@ public class ReliableServerSocket extends ServerSocket
     }
 
     /**
+     * Returns the shared DatagramSocket used by this server.
+     * Use it to create MultiplexedReliableSocket instances so that outgoing
+     * connections work on the same port.
+     */
+    public DatagramSocket getUnderlyingSocket()
+    {
+        return _serverSock;
+    }
+
+    /**
+     * Registers an external PacketSink (e.g., MultiplexedReliableSocket for an
+     * outgoing connection) as the recipient of segments arriving from the
+     * specified endpoint.
+     *
+     * IMPORTANT: call this method BEFORE sending a SYN (before connect()) on
+     * the registered socket - otherwise the peer's reply may arrive before
+     * the route is registered and be lost by the dispatcher.
+     *
+     * @param endpoint the remote peer address (IP + port).
+     * @param sink     the segment sink for this address.
+     */
+    public void registerRoute(SocketAddress endpoint, PacketSink sink)
+    {
+        synchronized (_clientSockTable) {
+            _clientSockTable.put(endpoint, sink);
+        }
+    }
+
+    /**
+     * Unregisters the route for the specified endpoint.
+     * Be sure to call this when closing/breaking a connection created via
+     * registerRoute(), otherwise the entry will remain dangling in the table.
+     *
+     * @param endpoint the remote peer address (IP + port).
+     */
+    public void unregisterRoute(SocketAddress endpoint)
+    {
+        synchronized (_clientSockTable) {
+            _clientSockTable.remove(endpoint);
+
+            if (_clientSockTable.isEmpty() && isClosed()) {
+                _serverSock.close();
+            }
+        }
+    }
+
+    /**
      * Registers a new client socket with the specified endpoint address.
      *
      * @param endpoint    the new socket.
      * @return the registered socket.
      */
-    private ReliableClientSocket addClientSocket(SocketAddress endpoint)
+    private PacketSink addClientSocket(SocketAddress endpoint)
     {
         synchronized (_clientSockTable) {
-            ReliableClientSocket sock = (ReliableClientSocket) _clientSockTable.get(endpoint);
+            PacketSink sock = _clientSockTable.get(endpoint);
 
             if (sock == null) {
                 try {
-                    sock = new ReliableClientSocket(_serverSock, endpoint);
-                    sock.addStateListener(_stateListener);
-                    _clientSockTable.put(endpoint, sock);
+                    ReliableClientSocket clientSock = new ReliableClientSocket(_serverSock, endpoint);
+                    clientSock.addStateListener(_stateListener);
+                    _clientSockTable.put(endpoint, clientSock);
+                    sock = clientSock;
                 }
                 catch (IOException xcp) {
                     xcp.printStackTrace();
@@ -291,10 +339,10 @@ public class ReliableServerSocket extends ServerSocket
      * @param endpoint     the socket.
      * @return the deregistered socket.
      */
-    private ReliableClientSocket removeClientSocket(SocketAddress endpoint)
+    private PacketSink removeClientSocket(SocketAddress endpoint)
     {
         synchronized (_clientSockTable) {
-            ReliableClientSocket sock = (ReliableClientSocket) _clientSockTable.remove(endpoint);
+            PacketSink sock = _clientSockTable.remove(endpoint);
 
             if (_clientSockTable.isEmpty()) {
                 if (isClosed()) {
@@ -317,9 +365,11 @@ public class ReliableServerSocket extends ServerSocket
     private ArrayList<ReliableSocket>      _backlog;
 
     /*
-     * A table of active opened client sockets.
+     * A table of active opened client sockets AND externally-registered
+     * routes (MultiplexedReliableSocket for outbound connections), keyed
+     * by remote SocketAddress.
      */
-    private HashMap<SocketAddress, ReliableClientSocket>   _clientSockTable;
+    private HashMap<SocketAddress, PacketSink>   _clientSockTable;
 
     private ReliableSocketStateListener _stateListener;
 
@@ -339,7 +389,7 @@ public class ReliableServerSocket extends ServerSocket
 
             while (true) {
                 DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
-                ReliableClientSocket sock = null;
+                PacketSink sock = null;
 
                 try {
                     _serverSock.receive(packet);
@@ -356,7 +406,7 @@ public class ReliableServerSocket extends ServerSocket
                             }
                         }
 
-                        sock = (ReliableClientSocket) _clientSockTable.get(endpoint);
+                        sock = _clientSockTable.get(endpoint);
                     }
 
                     if (sock != null) {
@@ -373,7 +423,7 @@ public class ReliableServerSocket extends ServerSocket
         }
     }
 
-    public class ReliableClientSocket extends ReliableSocket
+    public class ReliableClientSocket extends ReliableSocket implements PacketSink
     {
         public ReliableClientSocket(DatagramSocket sock,
                                     SocketAddress endpoint)
@@ -405,7 +455,7 @@ public class ReliableServerSocket extends ServerSocket
             }
         }
 
-        protected void segmentReceived(Segment s)
+        public void segmentReceived(Segment s)
         {
             synchronized (_queue) {
                 _queue.add(s);
