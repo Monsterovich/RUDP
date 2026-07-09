@@ -26,6 +26,37 @@ client.connect(serverSocket.getLocalSocketAddress());
 ```
 I also added an option to use pre-existing (and already bound) UDP sockets for the RUDP connection, just pass them as parameter to the constructor.
 
+Multiplexing support
+--
+
+This fork supports port multiplexing: `ReliableServerSocket` and one or more externally-created `PacketSink` implementations (e.g. `MultiplexedReliableSocket` for outbound connections) can now share the same underlying `DatagramSocket`.
+
+Here's an example of how I use this in my app. By the way, this implementation is compatible with the previous ReliableSocket. I just need to connect to and receive packets from a single port to bypass Port Restricted NAT. See https://github.com/GermanCoding/RUDP/issues/6
+
+<img width="889" height="293" alt="wireshark dump" src="https://github.com/user-attachments/assets/6ce4eeed-1386-4ffd-91a4-a4156e062139" />
+
+
+Server socket:
+
+```java
+DatagramSocket sock = new DatagramSocket(null);
+sock.setReuseAddress(true); // previously used by STUN client
+sock.bind(new InetSocketAddress(serverPort));
+ServerSocket server = new ReliableServerSocket(sock, 0);
+serverLatch.countDown();
+```
+
+Client socket (with new `MultiplexedReliableSocket`).
+
+```java
+serverLatch.await(); // wait for the server object to be initialized, since the server and client run in different threads
+ReliableServerSocket reliableServer = (ReliableServerSocket)server;
+socket = new MultiplexedReliableSocket(reliableServer);
+
+socket.connect(new InetSocketAddress(host, port), SOCKET_TIMEOUT_MS);
+```
+
+
 Javadoc
 --
 The javadoc of this project is available here:: https://build.germancoding.com/job/RUDP/javadoc/
