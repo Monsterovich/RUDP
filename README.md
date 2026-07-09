@@ -14,7 +14,7 @@ Usage
 --
 The design of the library is very similar (if not equal) to the Java socket API. To create a new connection with RUDP, do the same thing you would do with Java TCP/IO. The library will handle most stuff in the background, just like TCP.
 
-```
+```java
 // For the server
 ReliableServerSocket serverSocket = new ReliableServerSocket(0);
 Socket someRUDPClient = serverSocket.accept(); 
