@@ -77,6 +77,12 @@ public class MultiplexedReliableSocket extends ReliableSocket implements PacketS
         this._serverSocket = null;
     }
 
+    public MultiplexedReliableSocket(DatagramSocket sock, ReliableSocketProfile profile)
+    {
+        super(sock, profile);
+        this._serverSocket = null;
+    }
+
     /**
      * Creates a socket with automatic route management.
      * When connect() is called, the socket registers itself with the server,
@@ -98,6 +104,13 @@ public class MultiplexedReliableSocket extends ReliableSocket implements PacketS
         // reading thread has already exited) instead of creating a fresh
         // ReliableClientSocket. The peer's new connection attempt is then
         // silently swallowed forever.
+        addStateListener(new RouteCleanupListener());
+    }
+
+    public MultiplexedReliableSocket(ReliableServerSocket server, ReliableSocketProfile profile)
+    {
+        super(server.getUnderlyingSocket(), profile);
+        this._serverSocket = server;
         addStateListener(new RouteCleanupListener());
     }
 

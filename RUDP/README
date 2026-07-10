@@ -3,5 +3,5 @@ RUDP is an object-oriented implementation of a reliable, in-order, transport pro
 
 To compile RUDP using Ant (http://ant.apache.org), type:
 
-    ant -f build/build.xml
+    ant -f build.xml
 
