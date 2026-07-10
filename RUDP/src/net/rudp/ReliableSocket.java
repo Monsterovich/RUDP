@@ -1085,10 +1085,13 @@ public class ReliableSocket extends Socket
      * Sends a segment and increments its retransmission counter.
      *
      * @param  segment    the segment to be retransmitted.
+     * @return true if the segment exceeded the retransmission limit
+     *         (the caller must call connectionFailure() once it has
+     *         released the _unackedSentQueue monitor).
      * @throws IOException if an I/O error occurs in the
      *         underlying UDP socket.
      */
-    private void retransmitSegment(Segment segment)
+    private boolean retransmitSegment(Segment segment)
         throws IOException
     {
         if (_profile.maxRetrans() > 0) {
@@ -1096,8 +1099,7 @@ public class ReliableSocket extends Socket
         }
 
         if (_profile.maxRetrans() != 0 && segment.getRetxCounter() > _profile.maxRetrans()) {
-            connectionFailure();
-            return;
+            return true;
         }
 
         sendSegment(segment);
@@ -1111,6 +1113,8 @@ public class ReliableSocket extends Socket
                  }
              }
         }
+
+        return false;
     }
 
     /**
@@ -1343,6 +1347,7 @@ public class ReliableSocket extends Socket
 
         int lastInSequence = segment.getAck();
         int lastOutSequence = acks[acks.length-1];
+        boolean limitExceeded = false;
 
         synchronized (_unackedSentQueue) {
 
@@ -1364,13 +1369,13 @@ public class ReliableSocket extends Socket
 
             /* Retransmit segments */
             it = _unackedSentQueue.iterator();
-            while (it.hasNext()) {
+            while (it.hasNext() && !limitExceeded) {
                 Segment s = (Segment) it.next();
                 if ((compareSequenceNumbers(lastInSequence, s.seq()) < 0) &&
                     (compareSequenceNumbers(lastOutSequence, s.seq()) > 0)) {
 
                     try {
-                        retransmitSegment(s);
+                        limitExceeded = retransmitSegment(s);
                     }
                     catch (IOException xcp) {
                         xcp.printStackTrace();
@@ -1379,6 +1384,10 @@ public class ReliableSocket extends Socket
             }
 
             _unackedSentQueue.notifyAll();
+        }
+
+        if (limitExceeded) {
+            connectionFailure();
         }
     }
 
@@ -2052,17 +2061,26 @@ public class ReliableSocket extends Socket
     {
         public void run()
         {
+            boolean limitExceeded = false;
+
             synchronized (_unackedSentQueue) {
                 Iterator<Segment> it = _unackedSentQueue.iterator();
-                while (it.hasNext()) {
+                while (it.hasNext() && !limitExceeded) {
                     Segment s = (Segment) it.next();
                     try {
-                        retransmitSegment(s);
+                        limitExceeded = retransmitSegment(s);
                     }
                     catch (IOException xcp) {
                         xcp.printStackTrace();
                     }
                 }
+            }
+
+            // Only called after _unackedSentQueue has been released, so
+            // that the this -> _closeLock -> _unackedSentQueue lock order
+            // used by close()/connectionFailure() is never violated.
+            if (limitExceeded) {
+                connectionFailure();
             }
         }
     }
