@@ -307,6 +307,18 @@ public class ReliableServerSocket extends ServerSocket
     }
 
     /**
+     * Checks if there is a route registered for the specified endpoint.
+     *
+     * @param endpoint the remote peer address (IP + port).
+     * @return true if the route exists, false otherwise.
+     */
+    public boolean checkRoute(SocketAddress endpoint) {
+        synchronized (_clientSockTable) {
+            return _clientSockTable.containsKey(endpoint);
+        }
+    }
+
+    /**
      * Registers a new client socket with the specified endpoint address.
      *
      * @param endpoint    the new socket.

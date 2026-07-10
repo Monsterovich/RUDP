@@ -197,6 +197,9 @@ public class MultiplexedReliableSocket extends ReliableSocket implements PacketS
         _connectEndpoint = endpoint;
 
         if (_serverSocket != null && endpoint != null) {
+            if (_serverSocket.checkRoute(endpoint)) {
+                throw new IOException("Already connected");
+            }
             // Register before sending SYN to avoid race with incoming SYN-ACK
             _serverSocket.registerRoute(endpoint, this);
         }
