@@ -462,11 +462,8 @@ public class ReliableSocket extends Socket
                     closeImpl();
                     break;
                 case CLOSED:
-                    _retransmissionTimer.destroy();
-                    _cumulativeAckTimer.destroy();
-                    _keepAliveTimer.destroy();
-                    _nullSegmentTimer.destroy();
-                    _sock.close();
+                    destroyTimers();
+                    closeSocket();
                     break;
             }
 
@@ -1702,6 +1699,27 @@ public class ReliableSocket extends Socket
         }
 
         return null;
+    }
+
+    /**
+     * Destroys all four internal timer threads (retransmission, cumulative-ack,
+     * keep-alive, null-segment). Each is a Thread that was started as soon as
+     * this object was constructed (see field initializers below) and stays
+     * parked in Timer.run()'s wait() - scheduled or not - until destroy() is
+     * called on it. Exposed as protected so that subclasses can guarantee
+     * these threads terminate even when releasing a connection outside the
+     * normal close()/closeImpl() flow (e.g. cleaning up after a failed
+     * connect() attempt, which never calls close() itself).
+     *
+     * Safe to call more than once or on timers that were never scheduled;
+     * Timer.destroy() just flips a couple of flags and notifies.
+     */
+    protected void destroyTimers()
+    {
+        _retransmissionTimer.destroy();
+        _cumulativeAckTimer.destroy();
+        _keepAliveTimer.destroy();
+        _nullSegmentTimer.destroy();
     }
 
     /**

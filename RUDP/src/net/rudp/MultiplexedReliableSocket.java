@@ -211,6 +211,8 @@ public class MultiplexedReliableSocket extends ReliableSocket implements PacketS
 
         if (_serverSocket != null && endpoint != null) {
             if (_serverSocket.checkRoute(endpoint)) {
+                destroyTimers();
+                closeSocket();
                 throw new IOException("Already connected");
             }
             // Register before sending SYN to avoid race with incoming SYN-ACK
@@ -219,6 +221,8 @@ public class MultiplexedReliableSocket extends ReliableSocket implements PacketS
         try {
             super.connect(endpoint, timeout);
         } catch (IOException e) {
+            destroyTimers();
+            closeSocket();
             // If connection fails synchronously, remove the route we just added
             if (_serverSocket != null && endpoint != null) {
                 _serverSocket.unregisterRoute(endpoint);
