@@ -474,8 +474,8 @@ public class ReliableSocket extends Socket
                 _unackedSentQueue.notify();
             }
 
-            synchronized (_inSeqRecvQueue) {
-                _inSeqRecvQueue.notify();
+            synchronized (_recvQueueLock) {
+                _recvQueueLock.notify();
             }
         }
     }
@@ -492,9 +492,7 @@ public class ReliableSocket extends Socket
 
     public boolean isClosed()
     {
-        synchronized (_closeLock) {
-            return _closed;
-        }
+        return _closed;
     }
 
     public void setSoTimeout(int timeout)
@@ -1810,7 +1808,7 @@ public class ReliableSocket extends Socket
 
     private byte[]  _recvbuffer = new byte[65535];
 
-    private boolean _closed    = false;
+    private volatile boolean _closed = false;
     private boolean _connected = false;
     private boolean _reset     = false;
     private boolean _keepAlive = true;
