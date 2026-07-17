@@ -406,7 +406,13 @@ public class ReliableServerSocket extends ServerSocket
                 try {
                     _serverSock.receive(packet);
                     SocketAddress endpoint = packet.getSocketAddress();
-                    Segment s = Segment.parse(packet.getData(), 0, packet.getLength());
+                    Segment s;
+                    try {
+                        s = Segment.parse(packet.getData(), 0, packet.getLength());
+                    }
+                    catch (IllegalArgumentException xcp) {
+                        continue;
+                    }
 
                     synchronized (_clientSockTable) {
 
