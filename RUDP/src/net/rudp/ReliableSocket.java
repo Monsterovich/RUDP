@@ -1205,6 +1205,15 @@ public class ReliableSocket extends Socket
                 return;
             }
 
+            try {
+                Runtime.getRuntime().removeShutdownHook(_shutdownHook);
+            }
+            catch (IllegalStateException xcp) {
+                if (DEBUG) {
+                    xcp.printStackTrace();
+                }
+            }
+
             switch (_state) {
                 case SYN_SENT:
                     synchronized (this) {
