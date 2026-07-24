@@ -334,6 +334,14 @@ public class ReliableSocket extends Socket
 
         switch (_state) {
             case SYN_SENT:
+                try {
+                    Runtime.getRuntime().removeShutdownHook(_shutdownHook);
+                }
+                catch (IllegalStateException xcp) {
+                    if (DEBUG) {
+                        xcp.printStackTrace();
+                    }
+                }
                 connectionRefused();
                 _state = CLOSED;
                 if (timedout) {
