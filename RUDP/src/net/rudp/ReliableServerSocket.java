@@ -495,6 +495,15 @@ public class ReliableServerSocket extends ServerSocket
             System.out.println(getPort() + ": " + msg);
         }
 
+        /**
+         * Returns the endpoint this socket was registered under in
+         * _clientSockTable.
+         */
+        public SocketAddress getEndpoint()
+        {
+            return _endpoint;
+        }
+
         private ArrayList<Segment> _queue;
     }
 
@@ -528,15 +537,20 @@ public class ReliableServerSocket extends ServerSocket
         {
             // Remove client socket from the table of active connections.
             if (sock instanceof ReliableClientSocket) {
-                removeClientSocket(sock.getRemoteSocketAddress());
+                removeClientSocket(((ReliableClientSocket) sock).getEndpoint());
             }
         }
 
         public void connectionFailure(ReliableSocket sock)
         {
             // Remove client socket from the table of active connections.
+            // Uses getEndpoint(), not getRemoteSocketAddress(): by the time
+            // connectionFailure() notifies listeners, _connected is already
+            // false, so getRemoteSocketAddress() would return null here and
+            // removeClientSocket(null) would silently do nothing, leaving a
+            // dead entry permanently stuck in _clientSockTable.
             if (sock instanceof ReliableClientSocket) {
-                removeClientSocket(sock.getRemoteSocketAddress());
+                removeClientSocket(((ReliableClientSocket) sock).getEndpoint());
             }
         }
 
