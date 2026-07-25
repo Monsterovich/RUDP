@@ -1166,6 +1166,7 @@ public class ReliableSocket extends Socket
         _nullSegmentTimer.schedule(0, _profile.nullSegmentTimeout());
 
         if (_keepAlive) {
+            _keepAliveTimer.cancel();
             _keepAliveTimer.schedule(_profile.nullSegmentTimeout() * 6,
                                      _profile.nullSegmentTimeout() * 6);
         }
@@ -1293,6 +1294,10 @@ public class ReliableSocket extends Socket
                 case CLOSED:
                     _counters.setLastInSequence(segment.seq());
                     _state = SYN_RCVD;
+
+                    if (_keepAlive) {
+                        _keepAliveTimer.schedule(SYN_RCVD_TIMEOUT);
+                    }
 
                     Random rand = new Random(System.currentTimeMillis());
                     _profile = new ReliableSocketProfile(
@@ -1899,6 +1904,18 @@ public class ReliableSocket extends Socket
      */
     private Timer _keepAliveTimer =
         new Timer("ReliableSocket-KeepAliveTimer", new KeepAliveTimerTask());
+
+    /*
+     * Hard cap on how long an incoming connection may sit in SYN_RCVD
+     * waiting for the handshake-completing ACK. Deliberately NOT derived
+     * from _profile or from the peer's SYN segment (both of which may
+     * carry maxRetrans()==0, i.e. "unlimited retransmissions") - a remote
+     * peer must not be able to extend or disable this timeout. If the ACK
+     * never arrives, the incoming candidate socket (and its shutdown
+     * hook, timers, buffers) would otherwise leak forever, since
+     * _keepAliveTimer is not scheduled until ESTABLISHED is reached.
+     */
+    private static final long SYN_RCVD_TIMEOUT = 30000;
 
     private static final int MAX_SEQUENCE_NUMBER        = 255;
 
