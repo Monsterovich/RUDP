@@ -1021,7 +1021,7 @@ public class ReliableSocket extends Socket
                 _counters.incCumulativeAckCounter();
             }
 
-            if (_keepAlive) {
+            if (_keepAlive && !(s instanceof RSTSegment)) {
                 _keepAliveTimer.reset();
             }
         }
