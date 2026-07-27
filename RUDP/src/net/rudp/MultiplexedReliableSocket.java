@@ -287,6 +287,10 @@ public class MultiplexedReliableSocket extends ReliableSocket implements PacketS
             if (_serverSocket != null && _connectEndpoint != null) {
                 _serverSocket.unregisterRoute(_connectEndpoint);
             }
+            try {
+                close();
+            } catch (IOException e) {
+            }
         }
     }
 }
