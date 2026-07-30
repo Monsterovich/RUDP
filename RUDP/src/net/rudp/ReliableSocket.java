@@ -334,14 +334,7 @@ public class ReliableSocket extends Socket
 
         switch (_state) {
             case SYN_SENT:
-                try {
-                    Runtime.getRuntime().removeShutdownHook(_shutdownHook);
-                }
-                catch (IllegalStateException xcp) {
-                    if (DEBUG) {
-                        xcp.printStackTrace();
-                    }
-                }
+                removeShutdownHook();
                 connectionRefused();
                 _state = CLOSED;
                 if (timedout) {
@@ -448,14 +441,7 @@ public class ReliableSocket extends Socket
                 return;
             }
 
-            try {
-                Runtime.getRuntime().removeShutdownHook(_shutdownHook);
-            }
-            catch (IllegalStateException xcp) {
-                if (DEBUG) {
-                    xcp.printStackTrace();
-                }
-            }
+            removeShutdownHook();
 
             switch (_state) {
                 case SYN_SENT:
@@ -1214,14 +1200,7 @@ public class ReliableSocket extends Socket
                 return;
             }
 
-            try {
-                Runtime.getRuntime().removeShutdownHook(_shutdownHook);
-            }
-            catch (IllegalStateException xcp) {
-                if (DEBUG) {
-                    xcp.printStackTrace();
-                }
-            }
+            removeShutdownHook();
 
             switch (_state) {
                 case SYN_SENT:
@@ -1740,6 +1719,22 @@ public class ReliableSocket extends Socket
         _cumulativeAckTimer.destroy();
         _keepAliveTimer.destroy();
         _nullSegmentTimer.destroy();
+    }
+
+    /**
+     * Unregisters this socket's shutdown hook from the JVM, if it is
+     * still registered.
+     */
+    protected void removeShutdownHook()
+    {
+        try {
+            Runtime.getRuntime().removeShutdownHook(_shutdownHook);
+        }
+        catch (IllegalStateException xcp) {
+            if (DEBUG) {
+                xcp.printStackTrace();
+            }
+        }
     }
 
     /**
