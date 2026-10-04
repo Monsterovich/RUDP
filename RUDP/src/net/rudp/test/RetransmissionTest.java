@@ -7,6 +7,7 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketAddress;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -15,6 +16,7 @@ import net.rudp.Clock;
 import net.rudp.ReliableServerSocket;
 import net.rudp.ReliableSocket;
 import net.rudp.ReliableSocketProfile;
+import net.rudp.impl.EAKSegment;
 import net.rudp.impl.Segment;
 
 /**
@@ -51,11 +53,34 @@ public class RetransmissionTest
     /** How far the walk is willing to search for the next transmission. */
     private static final int SEARCH_LIMIT_MS = 60000;
 
+    /**
+     * How long to wait for the reader thread to have dealt with an injected
+     * segment. Real time, but only for thread scheduling: the reader picks
+     * datagrams off the socket by itself, so a retransmission it decides to
+     * make becomes observable a moment later rather than instantly. No
+     * protocol timing is measured with this clock - that is what the manual
+     * clock is for.
+     */
+    private static final int INJECTION_TIMEOUT_MS = 5000;
+
+    /**
+     * How long a wire is watched to conclude that nothing more is coming.
+     */
+    private static final int QUIET_GRACE_MS = 250;
+
+    /**
+     * Enough manual time to outlast any deadline a segment can be given: the
+     * backoff is capped at MAX_BACKOFF_SHIFT doublings of a timeout that is
+     * itself capped, so nothing stays due beyond this.
+     */
+    private static final long FAR_FUTURE_MS = 10L * 60L * 1000L;
+
     public static void main(String[] args)
     {
         Assert.suite("retransmission schedule");
 
         testBackoffSchedule();
+        testEakDrivenRecovery();
 
         System.exit(Assert.report());
     }
@@ -68,7 +93,7 @@ public class RetransmissionTest
             Peer peer = new Peer();
 
             ReliableServerSocket server = peer.start();
-            TestClientSocket client = new TestClientSocket(wire, profile(), clock);
+            TestClientSocket client = new TestClientSocket(wire, profile(2), clock);
 
             try {
                 client.connect(new InetSocketAddress("127.0.0.1", server.getLocalPort()),
@@ -139,7 +164,7 @@ public class RetransmissionTest
             Peer peer = new Peer();
 
             ReliableServerSocket server = peer.start();
-            TestClientSocket client = new TestClientSocket(wire, profile(), clock);
+            TestClientSocket client = new TestClientSocket(wire, profile(2), clock);
 
             try {
                 client.connect(new InetSocketAddress("127.0.0.1", server.getLocalPort()),
@@ -184,7 +209,7 @@ public class RetransmissionTest
             Peer peer = new Peer();
 
             ReliableServerSocket server = peer.start();
-            TestClientSocket client = new TestClientSocket(wire, profile(), clock);
+            TestClientSocket client = new TestClientSocket(wire, profile(2), clock);
 
             try {
                 client.connect(new InetSocketAddress("127.0.0.1", server.getLocalPort()),
@@ -279,13 +304,225 @@ public class RetransmissionTest
         return client.isConnected() ? -1 : clock.currentTimeMillis();
     }
 
-    private static ReliableSocketProfile profile()
+    /**
+     * Recovery driven by the peer's explicit "I am missing these" reports,
+     * rather than by the local schedule.
+     */
+    private static void testEakDrivenRecovery()
+    {
+        Assert.test("an EAK fills its hole once, with the retry backed off", () -> {
+            ManualClock clock = new ManualClock(1000000L);
+            Wire wire = new Wire();
+            Injector injector = new Injector();
+            Peer peer = new Peer();
+
+            ReliableServerSocket server = peer.start();
+            TestClientSocket client = new TestClientSocket(wire, profile(4), clock);
+
+            try {
+                client.connect(new InetSocketAddress("127.0.0.1", server.getLocalPort()),
+                        CONNECT_TIMEOUT_MS);
+                client.stopTimers();
+                peer.awaitConnection();
+
+                /*
+                 * Nothing acknowledges the payload: an ack would take the
+                 * segments off the schedule and close the hole on its own,
+                 * which is not what is under test here. Only EAKs are let
+                 * through, and they come from an injector rather than from the
+                 * peer so that the test decides how many arrive and when -
+                 * a peer whose acks are being swallowed never gets the chance
+                 * to send any.
+                 */
+                wire.passExtendedAcksOnly();
+
+                for (int i = 0; i < 5; i++) {
+                    write(client, new byte[] { 1, 2, 3, 4, 5 });
+                }
+
+                int[] seqs = wire.dataSeqs();
+                Assert.equals("five segments went out", 5, seqs.length);
+
+                injector.aimAt(client.getLocalPort());
+                long at = clock.currentTimeMillis();
+
+                /*
+                 * The receiver holds the first segment and the last two and is
+                 * missing the two in between: the exact shape an EAK describes,
+                 * where the hole is what lies between its ack number and its
+                 * last out-of-sequence ack number.
+                 */
+                injector.sendEak(seqs[0], new int[] { seqs[3], seqs[4] });
+
+                awaitDataSegments(wire, 7);
+
+                Assert.arrayEquals("the two segments of the hole, and nothing else",
+                        new int[] { seqs[1], seqs[2] }, wire.lastDataSeqs(2));
+
+                /*
+                 * The next EAK says exactly the same thing, which is what most
+                 * of them do: one goes out per few out-of-order arrivals, so a
+                 * window's worth of loss produces a stream of them. Refilling
+                 * the hole for each is what turned a single loss into a
+                 * multiple of the window.
+                 */
+                injector.sendEak(seqs[0], new int[] { seqs[3], seqs[4] });
+                assertQuiet(wire, 7);
+
+                /*
+                 * A segment sent after the hole, and named by no EAK, gives the
+                 * walk a reference: its timeout is the bare RTO, while the
+                 * hole's is that same RTO doubled, since the retransmission
+                 * the EAK caused counts as a timeout as far as the schedule is
+                 * concerned (RFC 6298 5.5).
+                 */
+                write(client, new byte[] { 6, 7, 8, 9, 10 });
+
+                Assert.equals("five originals, the hole twice over, and this one",
+                        8, wire.dataCount());
+
+                long firstRetry = walkToNextDataSegment(client, wire, clock, at, 9);
+                long timeout = firstRetry - at;
+
+                Assert.equals("only the segment without a backoff timed out first",
+                        1, wire.dataCount() - 8);
+
+                long secondRetry = walkToNextDataSegment(client, wire, clock, firstRetry, 11);
+
+                /*
+                 * Anchored at the send, not at the reference's retry: the hole's
+                 * deadline was stamped when the EAK caused its retransmission,
+                 * which the frozen clock puts at the same instant as the
+                 * original send. Doubling from there is what makes the next
+                 * attempt wait 2*RTO rather than the bare RTO it would have
+                 * waited without the backoff.
+                 */
+                Assert.equals("the hole's retries doubled its timeout",
+                        at + 2 * timeout, secondRetry);
+                Assert.equals("the hole went out again, both of its segments",
+                        2, wire.dataCount() - 9);
+            }
+            finally {
+                closeQuietly(client);
+                peer.shutdown();
+                server.close();
+                injector.close();
+                wire.close();
+            }
+        });
+
+        Assert.test("an EAK is honoured again once the hole is due", () -> {
+            ManualClock clock = new ManualClock(1000000L);
+            Wire wire = new Wire();
+            Injector injector = new Injector();
+            Peer peer = new Peer();
+
+            ReliableServerSocket server = peer.start();
+            TestClientSocket client = new TestClientSocket(wire, profile(4), clock);
+
+            try {
+                client.connect(new InetSocketAddress("127.0.0.1", server.getLocalPort()),
+                        CONNECT_TIMEOUT_MS);
+                client.stopTimers();
+                peer.awaitConnection();
+                wire.passExtendedAcksOnly();
+
+                for (int i = 0; i < 5; i++) {
+                    write(client, new byte[] { 1, 2, 3, 4, 5 });
+                }
+
+                int[] seqs = wire.dataSeqs();
+                Assert.equals("five segments went out", 5, seqs.length);
+
+                injector.aimAt(client.getLocalPort());
+                injector.sendEak(seqs[0], new int[] { seqs[3], seqs[4] });
+                awaitDataSegments(wire, 7);
+
+                /*
+                 * The timers are torn down in this harness, so the hole's own
+                 * deadline can pass without anything acting on it - which is
+                 * the situation the EAK path exists for. Step past every
+                 * deadline a segment could have been given and report the hole
+                 * again: a gate that had been closed to a segment after its
+                 * first retransmission would swallow this and leave the
+                 * connection stuck for good.
+                 */
+                clock.advance((int) FAR_FUTURE_MS);
+                injector.sendEak(seqs[0], new int[] { seqs[3], seqs[4] });
+
+                awaitDataSegments(wire, 9);
+
+                Assert.arrayEquals("the hole was filled a second time",
+                        new int[] { seqs[1], seqs[2] }, wire.lastDataSeqs(2));
+            }
+            finally {
+                closeQuietly(client);
+                peer.shutdown();
+                server.close();
+                injector.close();
+                wire.close();
+            }
+        });
+    }
+
+    /**
+     * Waits for the reader thread to have acted on an injected segment.
+     * <p>
+     * Overshooting the expected count is a failure and not something to wait
+     * out: an extra segment is the whole point of the checks that follow, so
+     * it is reported the moment it appears rather than after the wait.
+     */
+    private static void awaitDataSegments(Wire wire, int expected)
+    {
+        long deadline = System.currentTimeMillis() + INJECTION_TIMEOUT_MS;
+
+        while (System.currentTimeMillis() < deadline) {
+            int sent = wire.dataCount();
+
+            if (sent == expected) {
+                return;
+            }
+
+            Assert.isTrue("sent " + sent + " data segments, expected " + expected +
+                    " and never more", sent < expected);
+
+            sleep(STEP_MS);
+        }
+
+        throw new AssertionError("only " + wire.dataCount() + " of " + expected +
+                " data segments went out within " + INJECTION_TIMEOUT_MS + "ms");
+    }
+
+    /**
+     * Requires nothing new to reach the wire within a grace period.
+     */
+    private static void assertQuiet(Wire wire, int expected)
+    {
+        sleep(QUIET_GRACE_MS);
+        Assert.equals("nothing else went out", expected, wire.dataCount());
+    }
+
+    private static void sleep(int millis)
+    {
+        try {
+            Thread.sleep(millis);
+        }
+        catch (InterruptedException xcp) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("interrupted while waiting");
+        }
+    }
+
+    private static ReliableSocketProfile profile(int maxRetrans)
     {
         /*
          * A finite retransmission limit is what makes the give-up path
-         * reachable at all; the default profile retries forever.
+         * reachable at all; the default profile retries forever. The EAK cases
+         * ask for a few more attempts than that path needs, so that an extra
+         * retransmission shows up as an extra segment on the wire instead of
+         * quietly ending the connection.
          */
-        return new ReliableSocketProfile(96, 96, 1200, 64, 2, 3, 3, 3, 2000, 200, 300);
+        return new ReliableSocketProfile(96, 96, 1200, 64, maxRetrans, 3, 3, 3, 2000, 200, 300);
     }
 
     private static void closeQuietly(Socket socket)
@@ -333,19 +570,62 @@ public class RetransmissionTest
             _cutOff = true;
         }
 
+        /**
+         * Lets extended acknowledgments through and swallows everything else.
+         * <p>
+         * An EAK reports a hole and is retransmitted by nobody, so it is the
+         * only segment a test can inject to drive recovery from the peer's
+         * side; the acks that would resolve the hole on their own are exactly
+         * what has to be dropped.
+         */
+        void passExtendedAcksOnly()
+        {
+            _onlyExtendedAcks = true;
+        }
+
         int dataCount()
         {
-            int count = 0;
-
             synchronized (_sent) {
+                int count = 0;
+
                 for (byte[] packet : _sent) {
                     if (isData(packet)) {
                         count++;
                     }
                 }
-            }
 
-            return count;
+                return count;
+            }
+        }
+
+        /**
+         * Sequence numbers of every data segment sent, in order.
+         */
+        int[] dataSeqs()
+        {
+            synchronized (_sent) {
+                int[] seqs = new int[dataCount()];
+                int i = 0;
+
+                for (byte[] packet : _sent) {
+                    Segment s = parseQuietly(packet);
+
+                    if (s != null && "DAT".equals(s.type())) {
+                        seqs[i++] = s.seq();
+                    }
+                }
+
+                return seqs;
+            }
+        }
+
+        /**
+         * Sequence numbers of the last few data segments sent, in order.
+         */
+        int[] lastDataSeqs(int n)
+        {
+            int[] all = dataSeqs();
+            return Arrays.copyOfRange(all, Math.max(0, all.length - n), all.length);
         }
 
         @Override
@@ -366,22 +646,47 @@ public class RetransmissionTest
         public void receive(DatagramPacket p)
             throws IOException
         {
-            while (_cutOff) {
-                /*
-                 * Swallow the datagram and keep waiting, so the socket's reader
-                 * thread stays parked on the socket instead of processing an
-                 * acknowledgment and taking the segment off the schedule.
-                 */
+            while (true) {
                 super.receive(p);
-            }
 
-            super.receive(p);
+                if (_cutOff) {
+                    /*
+                     * Swallow the datagram and keep waiting, so the socket's
+                     * reader thread stays parked on the socket instead of
+                     * processing an acknowledgment and taking the segment off
+                     * the schedule.
+                     */
+                    continue;
+                }
+
+                if (_onlyExtendedAcks && !isExtendedAck(p)) {
+                    continue;
+                }
+
+                return;
+            }
+        }
+
+        private static Segment parseQuietly(byte[] packet)
+        {
+            try {
+                return Segment.parse(packet);
+            }
+            catch (RuntimeException xcp) {
+                return null;
+            }
         }
 
         private static boolean isData(byte[] packet)
         {
+            Segment s = parseQuietly(packet);
+            return s != null && "DAT".equals(s.type());
+        }
+
+        private static boolean isExtendedAck(DatagramPacket p)
+        {
             try {
-                return "DAT".equals(Segment.parse(packet).type());
+                return "EAK".equals(Segment.parse(p.getData(), p.getOffset(), p.getLength()).type());
             }
             catch (RuntimeException xcp) {
                 return false;
@@ -389,7 +694,49 @@ public class RetransmissionTest
         }
 
         private volatile boolean _cutOff;
+        private volatile boolean _onlyExtendedAcks;
         private final List<byte[]> _sent = new ArrayList<byte[]>();
+    }
+
+    /**
+     * Sends crafted EAK segments to the client, standing in for a receiver
+     * that reports the hole it has.
+     * <p>
+     * A plain socket on its own port rather than the peer's: the test needs to
+     * decide exactly how many EAKs arrive and when, and the peer under a
+     * client whose acks are being swallowed has no way to send any. The
+     * segments are the real thing on the wire - EAKSegment serializes itself -
+     * so the client's parsing and handling are exercised, not stubbed.
+     */
+    private static final class Injector extends DatagramSocket
+    {
+        Injector()
+            throws IOException
+        {
+            super(new InetSocketAddress("127.0.0.1", 0));
+        }
+
+        void aimAt(int port)
+        {
+            _target = new InetSocketAddress("127.0.0.1", port);
+        }
+
+        void sendEak(int lastInSequence, int[] outOfSequence)
+        {
+            if (_target == null) {
+                throw new AssertionError("the injector was never aimed at a port");
+            }
+
+            try {
+                byte[] packet = new EAKSegment(0, lastInSequence, outOfSequence).getBytes();
+                send(new DatagramPacket(packet, packet.length, _target));
+            }
+            catch (IOException xcp) {
+                throw new AssertionError("could not inject an EAK: " + xcp);
+            }
+        }
+
+        private volatile InetSocketAddress _target;
     }
 
     /** The server end: accepts one connection and drains whatever arrives. */

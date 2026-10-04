@@ -1136,6 +1136,39 @@ public class ReliableSocket extends Socket
     }
 
     /**
+     * Decides whether a received EAK may drive the retransmission of a
+     * segment sitting in the hole that the EAK reports.
+     * <p>
+     * An EAK is the receiver naming the segments it is missing, so the first
+     * one to arrive says something the retransmission schedule cannot: the
+     * exact contents of the hole. Acting on it straight away recovers a window
+     * in one round trip instead of waiting out a timeout.
+     * <p>
+     * Every EAK after that says nothing new. One is sent per few out-of-order
+     * arrivals and the cumulative-ack counter is not even the only trigger,
+     * so a window's worth of loss produces a stream of them; refilling the
+     * hole for each one multiplied a single loss by the size of the window on
+     * a path that was already congested, and no backoff was accumulated
+     * either, so the retries kept coming at the bare timeout.
+     * <p>
+     * Once a segment has been retransmitted its own deadline owns it, and this
+     * path keeps out of the way until that deadline comes due. That costs
+     * nothing in reliability - every hole segment is armed in _retxQueue and
+     * will be retried by the timer regardless - and it is what makes the
+     * backoff mean anything, since a timeout is only worth spacing out if
+     * nothing else resends the segment in between.
+     *
+     * @param s the segment the EAK reports as missing.
+     * @param nowMillis the current time.
+     * @return true if this segment may be retransmitted on the strength of
+     *         this EAK.
+     */
+    private static boolean eakMayRetransmit(Segment s, long nowMillis)
+    {
+        return !s.wasRetransmitted() || s.deadline() <= nowMillis;
+    }
+
+    /**
      * Sends a segment and increments its retransmission counter.
      *
      * @param  segment    the segment to be retransmitted.
@@ -1506,14 +1539,23 @@ public class ReliableSocket extends Socket
 
             _counters.decOutstandingSegsCounter(removed);
 
-            /* Retransmit segments */
+            /*
+             * Retransmit segments. The whole hole is filled, not just its head:
+             * the receiver holds everything after the hole in its out-of-order
+             * queue and advances over all of it as soon as the head lands, so
+             * one round of retransmission recovers the whole gap while hitting
+             * only the head would cost one round trip per missing segment.
+             */
+            long nowMillis = now();
             it = _unackedSentQueue.iterator();
             while (it.hasNext() && !limitExceeded) {
                 Segment s = (Segment) it.next();
                 if ((compareSequenceNumbers(lastInSequence, s.seq()) < 0) &&
-                    (compareSequenceNumbers(lastOutSequence, s.seq()) > 0)) {
+                    (compareSequenceNumbers(lastOutSequence, s.seq()) > 0) &&
+                    eakMayRetransmit(s, nowMillis)) {
 
                     try {
+                        s.backOffRto(RtoEstimator.MAX_BACKOFF_SHIFT);
                         limitExceeded = retransmitSegment(s);
                     }
                     catch (IOException xcp) {
