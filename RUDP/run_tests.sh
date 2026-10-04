@@ -13,6 +13,12 @@
 # Everything now lands in one output directory that is wiped first, so a
 # stale class cannot shadow a source file that moved or was renamed, and the
 # run fails loudly instead of reporting a green result it did not earn.
+#
+# Each test also runs under a timeout. A test that hangs used to take the whole
+# run with it - "set -e" has nothing to say about a test that never returns -
+# and Ctrl-C did not help either, because ReliableSocket's shutdown hook joins
+# threads that may themselves be stuck, so the JVM never got to exit. The kill
+# escalates to SIGKILL after a grace period for exactly that reason.
 
 set -e
 
@@ -31,8 +37,14 @@ javac -nowarn -d "$OUT" $(find RUDP/src -name '*.java')
 # regression in the segment wire format or in the retransmission schedule is
 # reported instead of being absorbed into the timing of a transfer test. They
 # run first because they are fast and localise a failure to a single method.
-TESTS="SegmentParseTest RtoEstimatorTest RetransmissionTest \
+# ConnectTest goes with them: it runs a real connection over loopback, but
+# without a peer that can be slow to answer, so it is fast and deterministic.
+TESTS="SegmentParseTest RtoEstimatorTest RetransmissionTest ConnectTest \
 SimpleClientServerTest MultiplexedClientServerTest DataTransferTest"
+
+# Generous enough for the transfer tests, short enough to not be mistaken for a
+# run that is still working.
+TEST_TIMEOUT_S=180
 
 first=1
 for test in $TESTS; do
@@ -44,7 +56,8 @@ for test in $TESTS; do
 
     echo ""
     echo "Running $test..."
-    java -cp "$OUT" "net.rudp.test.$test"
+    timeout --kill-after=10 "$TEST_TIMEOUT_S" \
+        java -cp "$OUT" "net.rudp.test.$test"
 done
 
 echo ""
