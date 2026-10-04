@@ -57,6 +57,56 @@ socket.connect(new InetSocketAddress(host, port), SOCKET_TIMEOUT_MS);
 ```
 
 
+Upstream fixes and optimizations
+--
+
+This fork includes a number of bug fixes and performance improvements that are not present
+in the original [GermanCoding/RUDP](https://github.com/GermanCoding/RUDP) (upstream ends
+at `28ed965`).
+
+### Bug fixes
+
+- **Malformed segments no longer silently kill the reader thread.** Bad packets (wrong
+  length, truncated data, invalid flags) are now rejected with `IllegalArgumentException`
+  instead of causing `ArrayIndexOutOfBoundsException` deep in the receive path.
+- **Stale `_clientSockTable` entries on connection failure.** Failed connections left
+  dangling entries in the client socket table, causing heap growth.
+- **Shutdown hook leak on connection failure.** `addShutdownHook()` was called on every
+  connection attempt but never removed on failure, causing permanent heap leaks.
+- **Half-open connections stuck in `SYN_RCVD`.** Incoming connections that never completed
+  the handshake were never cleaned up, leaking sockets indefinitely.
+- **RST packet resets keep-alive watchdog.** A stray RST would reset the keep-alive timer,
+  preventing zombie connection cleanup. Now RST closes immediately without touching the
+  watchdog.
+- **Potential deadlock in `connectionFailure()`.** Synchronization order between
+  `_listeners` and connection state could deadlock when callbacks triggered socket
+  operations.
+- **Thread leaks on socket close.** Several code paths on `close()` failed to interrupt
+  the retransmission timer thread.
+
+### Performance and protocol improvements
+
+- **Per-segment retransmission scheduling.** Replaced the single fixed-interval retransmission
+  tick with per-segment deadlines, so each segment tracks its own expiry independently.
+- **RTT estimation and RTO calculation (RFC 6298).** Added proper smoothed RTT and RTT
+  deviation tracking with exponential weighted moving averages. The RTO estimator is now
+  a pure, testable object (`RtoEstimator`) with configurable clock injection.
+- **Fast retransmit.** Segments are retransmitted on triple duplicate ACK without waiting
+  for the RTO timer.
+- **EAK hole recovery with backoff.** Explicit Acknowledgment gaps now retransmit only
+  the first segment of a hole (not the entire hole), with incremental backoff between
+  retries throttled to once per RTO.
+- **Reno-style congestion control.** Slow start (`cwnd += 1` per ACK), congestion avoidance
+  (`cwnd += 1/cwnd` per ACK), fast retransmit drops `cwnd` to 1, timeout drops to
+  `ssthresh = max(cwnd/2, 2)`. EAK recovery drops `cwnd = ssthresh` (not 1) to avoid
+  choking the send window. The effective send window is `min(maxOutstandingSegs, cwnd)`.
+- **Injectable clock.** `ReliableSocket` accepts a `Clock` implementation via constructor,
+  enabling deterministic testing of timeouts and retransmission logic.
+
+These changes together deliver roughly **7–10x throughput improvement** on loopback
+(16 MB payload, ~160 MB/s vs ~22 MB/s upstream), with no measurable latency penalty.
+The biggest gain came from fixing the retransmission storm, not micro-optimisations.
+
 Javadoc
 --
 The javadoc of this project is available here:: https://build.germancoding.com/job/RUDP/javadoc/
