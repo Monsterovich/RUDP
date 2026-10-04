@@ -26,7 +26,13 @@ mkdir -p "$OUT"
 echo "Compiling RUDP library and tests into $OUT..."
 javac -nowarn -d "$OUT" $(find RUDP/src -name '*.java')
 
-TESTS="SimpleClientServerTest MultiplexedClientServerTest DataTransferTest"
+# The first three are deterministic and need no clock: they either check pure
+# functions or drive a connection against a clock they advance by hand, so a
+# regression in the segment wire format or in the retransmission schedule is
+# reported instead of being absorbed into the timing of a transfer test. They
+# run first because they are fast and localise a failure to a single method.
+TESTS="SegmentParseTest RtoEstimatorTest RetransmissionTest \
+SimpleClientServerTest MultiplexedClientServerTest DataTransferTest"
 
 first=1
 for test in $TESTS; do
