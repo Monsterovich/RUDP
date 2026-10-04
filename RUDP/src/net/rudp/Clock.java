@@ -1,6 +1,6 @@
 /*
  * Simple Reliable UDP (rudp)
- * Copyright (c) 2009, Adrian Granados (agranados@ihmc.us)
+ * Copyright (c) 2026, Nikolay Borodin (monsterovich@gmail.com)
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
