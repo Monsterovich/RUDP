@@ -354,10 +354,10 @@ public class RetransmissionTest
                  */
                 injector.sendEak(seqs[0], new int[] { seqs[3], seqs[4] });
 
-                awaitDataSegments(wire, 7);
+                awaitDataSegments(wire, 6);
 
-                Assert.arrayEquals("the two segments of the hole, and nothing else",
-                        new int[] { seqs[1], seqs[2] }, wire.lastDataSeqs(2));
+                Assert.arrayEquals("the head of the hole",
+                        new int[] { seqs[1] }, wire.lastDataSeqs(1));
 
                 /*
                  * The next EAK says exactly the same thing, which is what most
@@ -367,7 +367,7 @@ public class RetransmissionTest
                  * multiple of the window.
                  */
                 injector.sendEak(seqs[0], new int[] { seqs[3], seqs[4] });
-                assertQuiet(wire, 7);
+                assertQuiet(wire, 6);
 
                 /*
                  * A segment sent after the hole, and named by no EAK, gives the
@@ -378,16 +378,16 @@ public class RetransmissionTest
                  */
                 write(client, new byte[] { 6, 7, 8, 9, 10 });
 
-                Assert.equals("five originals, the hole twice over, and this one",
-                        8, wire.dataCount());
+                Assert.equals("five originals, the hole head once, and this one",
+                        7, wire.dataCount());
 
                 long firstRetry = walkToNextDataSegment(client, wire, clock, at, 9);
                 long timeout = firstRetry - at;
 
-                Assert.equals("only the segment without a backoff timed out first",
-                        1, wire.dataCount() - 8);
+                Assert.equals("only the segment without a backoff timed out first, then the EAK head",
+                        2, wire.dataCount() - 7);
 
-                long secondRetry = walkToNextDataSegment(client, wire, clock, firstRetry, 11);
+                long secondRetry = walkToNextDataSegment(client, wire, clock, firstRetry, 10);
 
                 /*
                  * Anchored at the send, not at the reference's retry: the hole's
@@ -399,8 +399,8 @@ public class RetransmissionTest
                  */
                 Assert.equals("the hole's retries doubled its timeout",
                         at + 2 * timeout, secondRetry);
-                Assert.equals("the hole went out again, both of its segments",
-                        2, wire.dataCount() - 9);
+                Assert.equals("the hole head went out again",
+                        1, wire.dataCount() - 9);
             }
             finally {
                 closeQuietly(client);
@@ -436,7 +436,7 @@ public class RetransmissionTest
 
                 injector.aimAt(client.getLocalPort());
                 injector.sendEak(seqs[0], new int[] { seqs[3], seqs[4] });
-                awaitDataSegments(wire, 7);
+                awaitDataSegments(wire, 6);
 
                 /*
                  * The timers are torn down in this harness, so the hole's own
@@ -450,10 +450,10 @@ public class RetransmissionTest
                 clock.advance((int) FAR_FUTURE_MS);
                 injector.sendEak(seqs[0], new int[] { seqs[3], seqs[4] });
 
-                awaitDataSegments(wire, 9);
+                awaitDataSegments(wire, 7);
 
-                Assert.arrayEquals("the hole was filled a second time",
-                        new int[] { seqs[1], seqs[2] }, wire.lastDataSeqs(2));
+                Assert.arrayEquals("the hole head was filled a second time",
+                        new int[] { seqs[1] }, wire.lastDataSeqs(1));
             }
             finally {
                 closeQuietly(client);

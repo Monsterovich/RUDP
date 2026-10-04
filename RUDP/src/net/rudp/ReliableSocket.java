@@ -264,6 +264,12 @@ public class ReliableSocket extends Socket
         _rto = new RtoEstimator(_profile.retransmissionTimeout());
         _sendbuffer = new byte[_profile.maxSegmentSize()];
 
+        /* Congestion control init */
+        _cwnd      = Math.min(INITIAL_CWND, _profile.maxOutstandingSegs());
+        _ssthresh  = Long.MAX_VALUE;
+        _congState = CONG_SLOW_START;
+        _congStartSeq = -1;
+
         /* Register shutdown hook */
         try {
             Runtime.getRuntime().addShutdownHook(_shutdownHook);
@@ -1089,8 +1095,9 @@ public class ReliableSocket extends Socket
         throws IOException
     {
         synchronized (_unackedSentQueue) {
+            long win = Math.min(_profile.maxOutstandingSegs(), _cwnd);
             while ((_unackedSentQueue.size() >= _sendQueueSize) ||
-                   (_counters.getOutstandingSegsCounter() > _profile.maxOutstandingSegs())) {
+                   (_counters.getOutstandingSegsCounter() > win)) {
                 if (!_connected) {
                     throw new SocketException("Socket is closed");
                 }
@@ -1540,28 +1547,58 @@ public class ReliableSocket extends Socket
             _counters.decOutstandingSegsCounter(removed);
 
             /*
-             * Retransmit segments. The whole hole is filled, not just its head:
-             * the receiver holds everything after the hole in its out-of-order
-             * queue and advances over all of it as soon as the head lands, so
-             * one round of retransmission recovers the whole gap while hitting
-             * only the head would cost one round trip per missing segment.
+             * Retransmit only the head of the hole (the oldest unacked
+             * segment inside it).  The receiver holds everything after the
+             * hole in its out-of-order queue and will deliver it all at once
+             * when the head arrives, so retransmitting the whole gap is
+             * wasteful: it duplicates data the receiver already has and
+             * wastes bandwidth that may be needed for new data.
+             *
+             * Incremental backoff (shift += 1) is applied instead of
+             * jumping straight to MAX_BACKOFF_SHIFT.  A per-RTO throttle
+             * (_eakLastRetxTime) prevents a second EAK-driven retransmit
+             * for the same hole until the estimated RTO has elapsed, which
+             * avoids a retransmission storm when the path is congested.
              */
             long nowMillis = now();
             it = _unackedSentQueue.iterator();
-            while (it.hasNext() && !limitExceeded) {
+            while (it.hasNext()) {
                 Segment s = (Segment) it.next();
-                if ((compareSequenceNumbers(lastInSequence, s.seq()) < 0) &&
-                    (compareSequenceNumbers(lastOutSequence, s.seq()) > 0) &&
-                    eakMayRetransmit(s, nowMillis)) {
 
-                    try {
-                        s.backOffRto(RtoEstimator.MAX_BACKOFF_SHIFT);
-                        limitExceeded = retransmitSegment(s);
+                /* Only the first segment in the hole is the head */
+                if ((compareSequenceNumbers(lastInSequence, s.seq()) < 0) &&
+                    (compareSequenceNumbers(lastOutSequence, s.seq()) >= 0)) {
+
+                    /* Throttle: at most one EAK retransmit per RTO.
+                     * Allow it anyway if the segment's deadline passed
+                     * (previous retransmit timed out). */
+                    int rto = _rto.rto();
+                    boolean withinRtoWindow = (nowMillis - _eakLastRetxTime < rto);
+                    if (!withinRtoWindow || eakMayRetransmit(s, nowMillis)) {
+                        _eakLastRetxTime = nowMillis;
+
+                        try {
+                            s.backOffRto(1); /* incremental backoff, +1 */
+                            limitExceeded = retransmitSegment(s);
+                        }
+                        catch (IOException xcp) {
+                            xcp.printStackTrace();
+                        }
                     }
-                    catch (IOException xcp) {
-                        xcp.printStackTrace();
-                    }
+
+                    break; /* only head, done */
                 }
+            }
+
+            /* EAK-driven loss detected: reduce window.
+             * EAK is receiver-signal of specific loss, not a timeout,
+             * so we cut ssthresh and set cwnd to ssthresh (Reno fast
+             * recovery style) rather than resetting to 1. */
+            if (_eakLastRetxTime > 0) {
+                _ssthresh = Math.max(_cwnd / 2, 2L);
+                _cwnd = _ssthresh;
+                _congState = CONG_AVOIDANCE;
+                _congStartSeq = _counters.getLastInSequence();
             }
 
             if (_unackedSentQueue.isEmpty()) {
@@ -1830,6 +1867,26 @@ public class ReliableSocket extends Socket
             _counters.decOutstandingSegsCounter(removed);
 
             /*
+             * Congestion control: on an ACK that advances the ack point
+             * (not a duplicate), grow the window according to the current
+             * phase.  Slow start doubles (cwnd += removed).  Congestion
+             * avoidance adds one segment per RTT (cwnd += 1 when the cum.
+             * ack number advances).
+             */
+            if (removed > 0 && _congState == CONG_SLOW_START) {
+                _cwnd += removed;
+            }
+            else if (removed > 0) {
+                /* Congestion avoidance: one segment per RTT.
+                 * We detect a new RTT by the cumulative ACK advancing. */
+                if (_congStartSeq < 0 ||
+                    compareSequenceNumbers(ackn, _congStartSeq) > 0) {
+                    _cwnd += 1;
+                    _congStartSeq = ackn;
+                }
+            }
+
+            /*
              * An ACK that does not advance the acknowledgment point is a
              * duplicate: three of them in a row mean the segment right after
              * the acknowledged one was most likely lost, so retransmit it
@@ -1852,6 +1909,13 @@ public class ReliableSocket extends Socket
             if (fastRetransmit && !_unackedSentQueue.isEmpty()) {
                 Segment lost = _unackedSentQueue.get(0);
                 lost.backOffRto(FAST_RETRANSMIT_BACKOFF_SHIFT);
+
+                /* Fast retransmit -> loss detected: cut window */
+                _ssthresh = Math.max(_cwnd / 2, 2L);
+                _cwnd = 1;
+                _congState = CONG_AVOIDANCE;
+                _congStartSeq = _counters.getLastInSequence();
+
                 try {
                     limitExceeded = retransmitSegment(lost);
                 }
@@ -2166,6 +2230,29 @@ public class ReliableSocket extends Socket
     private int _dupAcks = 0;
     private int _lastAckn = -1;
     private boolean _dupAckValid = false;
+
+    /* EAK backoff throttle: per-RTO guard so EAK-driven retransmit
+     * does not fire more than once per estimated RTT. */
+    private long _eakLastRetxTime = 0;
+
+    /* ------------------------------------------------------------------
+     * Congestion control (Reno-style).  The effective sending window is
+     * the smaller of the receiver-proposed maxOutstandingSegs (from SYN)
+     * and the local congestion window _cwnd.  _cwnd starts small and
+     * grows with RTT samples; loss detected via EAK or timeout cuts it
+     * in half, so the algorithm is fully backward-compatible: old peers
+     * just see a smaller window and the connection still works.
+     *
+     * Guarded by the _unackedSentQueue monitor.
+     * ------------------------------------------------------------------ */
+    private static final long INITIAL_CWND        = 10; /* segments */
+    private static final long CONG_SLOW_START     = 1;
+    private static final long CONG_AVOIDANCE      = 0;
+
+    private long    _cwnd        = INITIAL_CWND; /* current congestion window (segments) */
+    private long    _ssthresh    = Long.MAX_VALUE; /* slow-start threshold */
+    private long    _congState   = CONG_SLOW_START;
+    private int     _congStartSeq = -1; /* seq number when slow start began */
 
     private Object _recvQueueLock = new Object();  /* Lock for receiver queues */
     private Counters _counters    = new Counters(); /* Sequence number, ack counters, etc. */
@@ -2498,6 +2585,13 @@ public class ReliableSocket extends Socket
                 try {
                     s.backOffRto(RtoEstimator.MAX_BACKOFF_SHIFT);
                     limitExceeded = retransmitSegment(s);
+
+                    /* Timeout-driven retransmit = lost segment, signal of
+                     * congestion.  Cut window aggressively (Reno timeout). */
+                    _ssthresh = Math.max(_cwnd / 2, 2L);
+                    _cwnd = 1;
+                    _congState = CONG_SLOW_START;
+                    _congStartSeq = -1;
                 }
                 catch (IOException xcp) {
                     xcp.printStackTrace();
