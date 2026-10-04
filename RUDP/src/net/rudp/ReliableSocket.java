@@ -286,7 +286,15 @@ public class ReliableSocket extends Socket
     public void bind(SocketAddress bindpoint)
         throws IOException
     {
-        _sock.bind(bindpoint);
+        /*
+         * Bound under _bindLock so that it wakes the reader thread waiting in
+         * awaitSocketBound(). The lock is always taken before the socket's own
+         * monitor, so the two cannot deadlock against each other.
+         */
+        synchronized (_bindLock) {
+            _sock.bind(bindpoint);
+            _bindLock.notifyAll();
+        }
     }
 
     public void connect(SocketAddress endpoint)
@@ -1975,6 +1983,15 @@ public class ReliableSocket extends Socket
     {
         try {
             /*
+             * Bound before the send rather than by it. DatagramSocket.send()
+             * binds an unbound socket itself, but it has to take the socket's
+             * own monitor to do so, and this thread may be holding _sendLock
+             * while it waits - see awaitSocketBound() for why nothing can ever
+             * release that monitor at that point.
+             */
+            bindIfNeeded();
+
+            /*
              * The serialization buffer and the packet are reused across
              * calls. Sends are serialized because this method is reached
              * concurrently from the application thread, the socket reader
@@ -2015,6 +2032,13 @@ public class ReliableSocket extends Socket
         throws IOException
     {
         try {
+            /*
+             * Never park inside receive() while the socket is still unbound:
+             * doing so holds the socket's own monitor until a datagram
+             * arrives, and blocks the bind that the first send needs.
+             */
+            awaitSocketBound();
+
             if (_recvPacket == null) {
                 _recvPacket = new DatagramPacket(_recvbuffer, _recvbuffer.length);
             }
@@ -2029,6 +2053,78 @@ public class ReliableSocket extends Socket
         }
 
         return null;
+    }
+
+    /**
+     * Binds the underlying socket to an ephemeral port on the wildcard address
+     * unless something has bound it already.
+     * <p>
+     * Exactly what DatagramSocket.send() does when it is handed an unbound
+     * socket, done here instead for two reasons: it runs on a thread that is
+     * not holding _sendLock, so a blocked bind cannot also stall every other
+     * sender, and it lets the reader thread parked in awaitSocketBound() be
+     * woken by a plain monitor notification.
+     */
+    private void bindIfNeeded()
+        throws IOException
+    {
+        if (_sock.isBound()) {
+            return;
+        }
+
+        synchronized (_bindLock) {
+            if (_sock.isBound()) {
+                return;
+            }
+
+            _sock.bind(new InetSocketAddress(0));
+            _bindLock.notifyAll();
+        }
+    }
+
+    /**
+     * Waits for the underlying socket to be bound before this thread waits for
+     * a datagram on it.
+     * <p>
+     * DatagramSocket.receive() holds the socket's own monitor for as long as it
+     * is parked, and both operations that need that monitor before a single
+     * datagram has been sent - bind(), and the bind that send() performs on an
+     * unbound socket - would then be waiting for a datagram that cannot arrive,
+     * because nothing has been sent yet. That is a deadlock rather than a slow
+     * path: the reader keeps the monitor until a datagram shows up, and no
+     * datagram can show up until the blocked sender lets go of it. A socket
+     * passed to the constructor unbound (new ReliableSocket(sock)) is exactly
+     * that case, and it hangs the first connect() for good whenever the reader
+     * thread wins the race to receive() first - a coin flip that decides
+     * whether a connection works at all.
+     * <p>
+     * A reader waiting here holds no socket monitor, so the bind that releases
+     * it can always get one. The wait is bounded, so a socket bound behind this
+     * monitor's back - by the application holding on to the DatagramSocket it
+     * passed in - is still picked up, and so is a close(); a socket that is
+     * never bound at all costs one wakeup per BOUND_POLL_MS and nothing else.
+     */
+    private void awaitSocketBound()
+    {
+        while (!_sock.isBound()) {
+            if (_sock.isClosed()) {
+                return;
+            }
+
+            synchronized (_bindLock) {
+                if (_sock.isBound()) {
+                    return;
+                }
+
+                try {
+                    _bindLock.wait(BOUND_POLL_MS);
+                }
+                catch (InterruptedException xcp) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }
     }
 
     /**
@@ -2183,6 +2279,14 @@ public class ReliableSocket extends Socket
     private DatagramPacket _sendPacket;
     private final Object _sendLock = new Object();
 
+    /*
+     * Guards the moment the underlying socket becomes bound, which the reader
+     * thread waits for (see awaitSocketBound()) and which sendSegmentImpl()
+     * performs. Taken before the socket's own monitor, never the other way
+     * round.
+     */
+    private final Object _bindLock = new Object();
+
     private volatile boolean _closed = false;
     private boolean _connected = false;
     private boolean _reset     = false;
@@ -2330,6 +2434,16 @@ public class ReliableSocket extends Socket
     private static final int FAST_RETRANSMIT_BACKOFF_SHIFT = 0;
 
     private static final int MAX_SEQUENCE_NUMBER        = 255;
+
+    /*
+     * How long the reader thread sleeps between checks for the underlying
+     * socket having been bound. It only ever waits before the first datagram
+     * of a connection is read, so a working socket never pays for it; on a
+     * socket that is never bound it only bounds how late the reader notices a
+     * close(), since a bind that goes through bind() or sendSegmentImpl()
+     * notifies the reader outright.
+     */
+    private static final int BOUND_POLL_MS = 100;
 
     private static final int CLOSED      = 0; /* There is not an active or pending connection */
     private static final int SYN_RCVD    = 1; /* Request to connect received, waiting ACK */

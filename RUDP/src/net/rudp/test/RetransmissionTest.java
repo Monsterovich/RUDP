@@ -46,6 +46,7 @@ import net.rudp.Clock;
 import net.rudp.ReliableServerSocket;
 import net.rudp.ReliableSocket;
 import net.rudp.ReliableSocketProfile;
+import net.rudp.impl.ACKSegment;
 import net.rudp.impl.EAKSegment;
 import net.rudp.impl.Segment;
 
@@ -121,6 +122,7 @@ public class RetransmissionTest
             ManualClock clock = new ManualClock(1000000L);
             Wire wire = new Wire();
             Peer peer = new Peer();
+            Injector injector = new Injector();
 
             ReliableServerSocket server = peer.start();
             TestClientSocket client = new TestClientSocket(wire, profile(2), clock);
@@ -130,13 +132,15 @@ public class RetransmissionTest
                         CONNECT_TIMEOUT_MS);
                 Assert.isTrue("connected", client.isConnected());
 
+                peer.awaitConnection();
+                settleNullSegment(client, wire, injector);
+
                 /*
                  * From here on the test owns the schedule: with the timers gone
                  * the only path to a retransmission is runRetransmissionPass(),
                  * so nothing can fire on its own and race the walk.
                  */
                 client.stopTimers();
-                peer.awaitConnection();
 
                 wire.cutOff();
 
@@ -184,6 +188,7 @@ public class RetransmissionTest
                 closeQuietly(client);
                 peer.shutdown();
                 server.close();
+                injector.close();
                 wire.close();
             }
         });
@@ -192,6 +197,7 @@ public class RetransmissionTest
             ManualClock clock = new ManualClock(1000000L);
             Wire wire = new Wire();
             Peer peer = new Peer();
+            Injector injector = new Injector();
 
             ReliableServerSocket server = peer.start();
             TestClientSocket client = new TestClientSocket(wire, profile(2), clock);
@@ -199,8 +205,9 @@ public class RetransmissionTest
             try {
                 client.connect(new InetSocketAddress("127.0.0.1", server.getLocalPort()),
                         CONNECT_TIMEOUT_MS);
-                client.stopTimers();
                 peer.awaitConnection();
+                settleNullSegment(client, wire, injector);
+                client.stopTimers();
                 wire.cutOff();
 
                 long firstSentAt = clock.currentTimeMillis();
@@ -229,6 +236,7 @@ public class RetransmissionTest
                 closeQuietly(client);
                 peer.shutdown();
                 server.close();
+                injector.close();
                 wire.close();
             }
         });
@@ -237,6 +245,7 @@ public class RetransmissionTest
             ManualClock clock = new ManualClock(1000000L);
             Wire wire = new Wire();
             Peer peer = new Peer();
+            Injector injector = new Injector();
 
             ReliableServerSocket server = peer.start();
             TestClientSocket client = new TestClientSocket(wire, profile(2), clock);
@@ -244,8 +253,9 @@ public class RetransmissionTest
             try {
                 client.connect(new InetSocketAddress("127.0.0.1", server.getLocalPort()),
                         CONNECT_TIMEOUT_MS);
-                client.stopTimers();
                 peer.awaitConnection();
+                settleNullSegment(client, wire, injector);
+                client.stopTimers();
                 wire.cutOff();
 
                 for (int i = 0; i < 3; i++) {
@@ -270,6 +280,7 @@ public class RetransmissionTest
                 closeQuietly(client);
                 peer.shutdown();
                 server.close();
+                injector.close();
                 wire.close();
             }
         });
@@ -280,6 +291,48 @@ public class RetransmissionTest
     {
         client.getOutputStream().write(payload);
         client.getOutputStream().flush();
+    }
+
+    /**
+     * Settles the null segment the socket sends the moment a connection is
+     * opened, so that everything after this point has to reason only about the
+     * segments the test writes itself.
+     * <p>
+     * Two things about that segment are none of the test's business, and both
+     * are settled here by acknowledging it rather than by changing the socket:
+     * <ul>
+     * <li>It carries a sequence number, so it has to be on the wire before the
+     *     first segment the test writes. Otherwise it lands between two of
+     *     them, and an extended acknowledgment naming the hole between those
+     *     two finds the null segment at its head and fills the wrong
+     *     hole.</li>
+     * <li>It is acknowledged like anything else, and every acknowledgment is
+     *     one round trip sample. Against this frozen clock every sample is
+     *     zero, so how many of them the estimator saw decides how far its
+     *     estimate has converged - and with it every deadline the checks
+     *     below are stated in. Acknowledging it here pins the count at exactly
+     *     one: whichever acknowledgment reaches the client first takes it off
+     *     the schedule and supplies the sample, and the one after it finds an
+     *     empty queue and takes nothing. Whichever order they arrive in, the
+     *     test can no longer tell.</li>
+     * </ul>
+     * Two acknowledgments go out so that the first is known to have been dealt
+     * with rather than merely picked up: the client reads one datagram at a
+     * time, so the second can only be read after the first has been handled.
+     */
+    private static void settleNullSegment(TestClientSocket client, Wire wire, Injector injector)
+    {
+        wire.awaitNullSegment();
+        injector.aimAt(client.getLocalPort());
+
+        int before = wire.receivedCount();
+        int nul = wire.nullSegmentSeq();
+
+        injector.sendAck(nul);
+        wire.awaitReceived(before + 1);
+
+        injector.sendAck(nul);
+        wire.awaitReceived(before + 2);
     }
 
 
@@ -352,8 +405,9 @@ public class RetransmissionTest
             try {
                 client.connect(new InetSocketAddress("127.0.0.1", server.getLocalPort()),
                         CONNECT_TIMEOUT_MS);
-                client.stopTimers();
                 peer.awaitConnection();
+                settleNullSegment(client, wire, injector);
+                client.stopTimers();
 
                 /*
                  * Nothing acknowledges the payload: an ack would take the
@@ -453,8 +507,9 @@ public class RetransmissionTest
             try {
                 client.connect(new InetSocketAddress("127.0.0.1", server.getLocalPort()),
                         CONNECT_TIMEOUT_MS);
-                client.stopTimers();
                 peer.awaitConnection();
+                settleNullSegment(client, wire, injector);
+                client.stopTimers();
                 wire.passExtendedAcksOnly();
 
                 for (int i = 0; i < 5; i++) {
@@ -613,6 +668,90 @@ public class RetransmissionTest
             _onlyExtendedAcks = true;
         }
 
+        /**
+         * Waits for the null segment a connection sends the moment it is
+         * opened.
+         * <p>
+         * The socket schedules it with no delay (see
+         * ReliableSocket.connectionOpened), on a timer thread of its own and
+         * in real time, so it is always sent - and it is sent concurrently
+         * with whatever the test does next. Since it carries a sequence number
+         * of its own, a segment written while it is still in flight lands
+         * between it and the segment after, and an extended acknowledgment
+         * naming a hole then walks into the null segment first and fills the
+         * wrong hole.
+         */
+        void awaitNullSegment()
+        {
+            long deadline = System.currentTimeMillis() + INJECTION_TIMEOUT_MS;
+
+            while (System.currentTimeMillis() < deadline) {
+                if (nullSegmentSeq() >= 0) {
+                    return;
+                }
+
+                sleep(STEP_MS);
+            }
+
+            throw new AssertionError("no null segment went out within " +
+                    INJECTION_TIMEOUT_MS + "ms of the connection being opened");
+        }
+
+        /**
+         * The sequence number the null segment went out with, or -1 if none has
+         * gone out yet.
+         */
+        int nullSegmentSeq()
+        {
+            synchronized (_sent) {
+                for (byte[] packet : _sent) {
+                    Segment s = parseQuietly(packet);
+
+                    if (s != null && "NUL".equals(s.type())) {
+                        return s.seq();
+                    }
+                }
+            }
+
+            return -1;
+        }
+
+        /**
+         * How many datagrams the client has picked off the socket so far.
+         */
+        int receivedCount()
+        {
+            synchronized (_sent) {
+                return _received;
+            }
+        }
+
+        /**
+         * Waits for the client to have picked up at least the given number of
+         * datagrams.
+         * <p>
+         * This is what makes an ordering deterministic where a clock cannot:
+         * the client reads one datagram at a time and in order, so a datagram
+         * that has been picked up proves the one before it was dealt with, and
+         * waiting for a second one proves the first was dealt with rather than
+         * merely read off the socket.
+         */
+        void awaitReceived(int atLeast)
+        {
+            long deadline = System.currentTimeMillis() + INJECTION_TIMEOUT_MS;
+
+            while (System.currentTimeMillis() < deadline) {
+                if (receivedCount() >= atLeast) {
+                    return;
+                }
+
+                sleep(STEP_MS);
+            }
+
+            throw new AssertionError("only " + receivedCount() + " of " + atLeast +
+                    " datagrams reached the client within " + INJECTION_TIMEOUT_MS + "ms");
+        }
+
         int dataCount()
         {
             synchronized (_sent) {
@@ -679,6 +818,10 @@ public class RetransmissionTest
             while (true) {
                 super.receive(p);
 
+                synchronized (_sent) {
+                    _received++;
+                }
+
                 if (_cutOff) {
                     /*
                      * Swallow the datagram and keep waiting, so the socket's
@@ -725,18 +868,21 @@ public class RetransmissionTest
 
         private volatile boolean _cutOff;
         private volatile boolean _onlyExtendedAcks;
+        private int _received;
         private final List<byte[]> _sent = new ArrayList<byte[]>();
     }
 
     /**
-     * Sends crafted EAK segments to the client, standing in for a receiver
-     * that reports the hole it has.
+     * Sends crafted acknowledgment segments to the client, standing in for the
+     * peer: extended acknowledgments that report the holes it has, and plain
+     * ones that take a segment off the schedule.
      * <p>
      * A plain socket on its own port rather than the peer's: the test needs to
-     * decide exactly how many EAKs arrive and when, and the peer under a
-     * client whose acks are being swallowed has no way to send any. The
-     * segments are the real thing on the wire - EAKSegment serializes itself -
-     * so the client's parsing and handling are exercised, not stubbed.
+     * decide exactly how many acknowledgments arrive and when, and the peer
+     * under a client whose acks are being swallowed has no way to send any. The
+     * segments are the real thing on the wire - EAKSegment and ACKSegment
+     * serialize themselves - so the client's parsing and handling are
+     * exercised, not stubbed.
      */
     private static final class Injector extends DatagramSocket
     {
@@ -753,16 +899,29 @@ public class RetransmissionTest
 
         void sendEak(int lastInSequence, int[] outOfSequence)
         {
+            sendTo(new EAKSegment(0, lastInSequence, outOfSequence).getBytes());
+        }
+
+        /**
+         * Acknowledges everything up to and including the given sequence
+         * number, the way the peer would.
+         */
+        void sendAck(int lastInSequence)
+        {
+            sendTo(new ACKSegment(0, lastInSequence).getBytes());
+        }
+
+        private void sendTo(byte[] packet)
+        {
             if (_target == null) {
                 throw new AssertionError("the injector was never aimed at a port");
             }
 
             try {
-                byte[] packet = new EAKSegment(0, lastInSequence, outOfSequence).getBytes();
                 send(new DatagramPacket(packet, packet.length, _target));
             }
             catch (IOException xcp) {
-                throw new AssertionError("could not inject an EAK: " + xcp);
+                throw new AssertionError("could not inject a segment: " + xcp);
             }
         }
 
