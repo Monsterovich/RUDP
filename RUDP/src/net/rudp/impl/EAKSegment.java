@@ -85,6 +85,28 @@ public class EAKSegment extends ACKSegment
         return buffer;
     }
 
+    /**
+     * Writes the full EAK segment into the caller-supplied buffer. The base
+     * Segment.writeTo() only emits the 6-byte header, so this overrides it to
+     * also serialize the out-of-sequence acknowledgement numbers, mirroring
+     * getBytes() while reusing the caller's buffer.
+     */
+    public int writeTo(byte[] buffer, int off)
+    {
+        // Zero the whole segment so a reused send buffer cannot leak stale bytes.
+        for (int i = 0; i < length(); i++) {
+            buffer[off + i] = 0;
+        }
+
+        super.writeTo(buffer, off);
+
+        for (int i = 0; i < _acks.length; i++) {
+            buffer[off + 4 + i] = (byte) (_acks[i] & 0xFF);
+        }
+
+        return length();
+    }
+
     protected void parseBytes(byte[] buffer, int off, int len)
     {
         super.parseBytes(buffer, off, len);

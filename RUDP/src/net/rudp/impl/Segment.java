@@ -48,6 +48,7 @@ public abstract class Segment
     {
         _nretx = 0;
         _ackn = -1;
+        _deadline = Long.MAX_VALUE;
     }
 
     public abstract String type();
@@ -95,13 +96,98 @@ public abstract class Segment
     public byte[] getBytes()
     {
         byte[] buffer = new byte[length()];
-
-        buffer[0] = (byte) (_flags & 0xFF);
-        buffer[1] = (byte) (_hlen & 0xFF);
-        buffer[2] = (byte) (_seqn & 0xFF);
-        buffer[3] = (byte) (_ackn & 0xFF);
-
+        writeTo(buffer, 0);
         return buffer;
+    }
+
+    /**
+     * Serializes this segment into an existing buffer, avoiding the
+     * per-packet byte[] allocation that getBytes() would incur.
+     *
+     * @param buffer the destination buffer.
+     * @param off    the offset in the destination buffer.
+     * @return the number of bytes written.
+     */
+    public int writeTo(byte[] buffer, int off)
+    {
+        buffer[off] = (byte) (_flags & 0xFF);
+        buffer[off+1] = (byte) (_hlen & 0xFF);
+        buffer[off+2] = (byte) (_seqn & 0xFF);
+        buffer[off+3] = (byte) (_ackn & 0xFF);
+        buffer[off+4] = 0; /* checksum (unused) */
+        buffer[off+5] = 0;
+
+        return RUDP_HEADER_LEN;
+    }
+
+    /**
+     * Records the instant at which this segment went (re)transmitted and
+     * the instant at which it becomes eligible for a timeout retransmission.
+     */
+    public void markSent(long nowMillis, int rtoMillis)
+    {
+        _sentTime = nowMillis;
+        _deadline = nowMillis + rtoMillis;
+    }
+
+    public long sentTime()
+    {
+        return _sentTime;
+    }
+
+    public long deadline()
+    {
+        return _deadline;
+    }
+
+    /**
+     * Records one more timeout on this segment, doubling its retransmission
+     * backoff up to 'shift' doublings. The multiplier itself is applied by the
+     * caller when it stamps the next deadline (see ReliableSocket.rtoFor), so
+     * that the base RTO and its bounds stay policy of the socket.
+     */
+    public void backOffRto(int shift)
+    {
+        if (_rtoShift < shift) {
+            _rtoShift++;
+        }
+    }
+
+    /**
+     * Number of exponential backoff doublings accumulated by this segment.
+     */
+    public int rtoShift()
+    {
+        return _rtoShift;
+    }
+
+    public void clearBackOff()
+    {
+        _rtoShift = 0;
+    }
+
+    /**
+     * Flags this segment as retransmitted at least once. Karn's algorithm:
+     * such a segment must never be used to sample the round trip time.
+     */
+    public void markRetransmitted()
+    {
+        _retransmitted = true;
+    }
+
+    public boolean wasRetransmitted()
+    {
+        return _retransmitted;
+    }
+
+    public void markAcked()
+    {
+        _acked = true;
+    }
+
+    public boolean isAcked()
+    {
+        return _acked;
     }
 
     public String toString()
@@ -196,4 +282,10 @@ public abstract class Segment
     private int _ackn;  /* Acknowledgment number field */
 
     private int _nretx; /* Retransmission counter */
+
+    private long _sentTime;      /* Wall clock of the last transmission */
+    private long _deadline;      /* Wall clock at which a timeout retransmission is due */
+    private int  _rtoShift;      /* Exponential backoff doublings for the retransmission timeout */
+    private boolean _retransmitted;
+    private boolean _acked;
 }

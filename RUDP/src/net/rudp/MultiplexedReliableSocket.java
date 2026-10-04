@@ -33,7 +33,7 @@ package net.rudp;
 import java.io.IOException;
 import java.net.DatagramSocket;
 import java.net.SocketAddress;
-import java.util.ArrayList;
+import java.util.ArrayDeque;
 
 import net.rudp.impl.Segment;
 
@@ -118,7 +118,7 @@ public class MultiplexedReliableSocket extends ReliableSocket implements PacketS
     {
         // The queue must be ready BEFORE super.init() starts the
         // reading thread (_sockThread.start()), otherwise NPE/race condition.
-        _queue = new ArrayList<Segment>();
+        _queue = new ArrayDeque<Segment>();
         super.init(sock, profile);
     }
 
@@ -143,7 +143,7 @@ public class MultiplexedReliableSocket extends ReliableSocket implements PacketS
                 return null;
             }
 
-            return (Segment) _queue.remove(0);
+            return (Segment) _queue.pollFirst();
         }
     }
 
@@ -154,7 +154,7 @@ public class MultiplexedReliableSocket extends ReliableSocket implements PacketS
     public void segmentReceived(Segment s)
     {
         synchronized (_queue) {
-            _queue.add(s);
+            _queue.offerLast(s);
             _queue.notify();
         }
     }
@@ -168,9 +168,10 @@ public class MultiplexedReliableSocket extends ReliableSocket implements PacketS
     protected void closeSocket()
     {
         synchronized (_queue) {
-            // Clear any pending segments and insert null to wake up the thread
+            // Drop any pending segments and wake up the reading thread.
+            // _localClosed (checked by receiveSegmentImpl) is what terminates
+            // it; the queue itself must stay free of null elements.
             _queue.clear();
-            _queue.add(null);
             _localClosed = true;
             _queue.notify();
         }
@@ -233,7 +234,7 @@ public class MultiplexedReliableSocket extends ReliableSocket implements PacketS
         }
     }
 
-    private ArrayList<Segment> _queue;
+    private ArrayDeque<Segment> _queue;
 
     // Reference to the server socket for automatic route registration/unregistration.
     // If null, the user must manually call registerRoute/unregisterRoute.

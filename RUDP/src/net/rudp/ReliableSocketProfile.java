@@ -39,17 +39,22 @@ package net.rudp;
  */
 public class ReliableSocketProfile
 {
-    public final static int MAX_SEND_QUEUE_SIZE    = 32;
-    public final static int MAX_RECV_QUEUE_SIZE    = 32;
+    /*
+     * Queue depths and the outstanding-segment count are bounded by the
+     * 8-bit sequence number space (255 values, compared within a half-space
+     * of 127), so all window-related parameters must stay well below 128.
+     */
+    public final static int MAX_SEND_QUEUE_SIZE    = 96;
+    public final static int MAX_RECV_QUEUE_SIZE    = 96;
 
-    public final static int MAX_SEGMENT_SIZE       = 128;
-    public final static int MAX_OUTSTANDING_SEGS   = 3;
+    public final static int MAX_SEGMENT_SIZE       = 1200;
+    public final static int MAX_OUTSTANDING_SEGS   = 64;
     public final static int MAX_RETRANS            = 3;
     public final static int MAX_CUMULATIVE_ACKS    = 3;
     public final static int MAX_OUT_OF_SEQUENCE    = 3;
     public final static int MAX_AUTO_RESET         = 3;
     public final static int NULL_SEGMENT_TIMEOUT   = 2000;
-    public final static int RETRANSMISSION_TIMEOUT = 600;
+    public final static int RETRANSMISSION_TIMEOUT = 200;
     public final static int CUMULATIVE_ACK_TIMEOUT = 300;
 
     /**

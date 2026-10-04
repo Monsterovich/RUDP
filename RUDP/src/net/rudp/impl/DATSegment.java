@@ -77,9 +77,16 @@ public class DATSegment extends Segment
 
     public byte[] getBytes()
     {
-        byte[] buffer = super.getBytes();
-        System.arraycopy(_data, 0, buffer, RUDP_HEADER_LEN, _data.length);
+        byte[] buffer = new byte[length()];
+        writeTo(buffer, 0);
         return buffer;
+    }
+
+    public int writeTo(byte[] buffer, int off)
+    {
+        int hlen = super.writeTo(buffer, off);
+        System.arraycopy(_data, 0, buffer, off+hlen, _data.length);
+        return hlen + _data.length;
     }
 
     public void parseBytes(byte[] buffer, int off, int len)

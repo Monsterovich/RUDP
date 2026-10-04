@@ -45,9 +45,13 @@ import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
 import java.nio.channels.SocketChannel;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Iterator;
+import java.util.PriorityQueue;
 import java.util.Random;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import net.rudp.impl.ACKSegment;
 import net.rudp.impl.DATSegment;
@@ -231,6 +235,12 @@ public class ReliableSocket extends Socket
 
         _sendBufferSize    = (_profile.maxSegmentSize() - Segment.RUDP_HEADER_LEN) * 32;
         _recvBufferSize = (_profile.maxSegmentSize() - Segment.RUDP_HEADER_LEN) * 32;
+
+        _sendQueueSize = _profile.maxSendQueueSize();
+        _recvQueueSize = _profile.maxRecvQueueSize();
+
+        _rto = _profile.retransmissionTimeout();
+        _sendbuffer = new byte[_profile.maxSegmentSize()];
 
         /* Register shutdown hook */
         try {
@@ -848,16 +858,23 @@ public class ReliableSocket extends Socket
                     }
                 }
 
-                for (Iterator<Segment> it = _inSeqRecvQueue.iterator(); it.hasNext(); ) {
-                    Segment s = (Segment) it.next();
+                /*
+                 * Drains the head of the in-sequence queue. Every element is
+                 * either a data, reset or FIN segment (handleSegment only
+                 * ever enqueues those), so peeking from the front and polling
+                 * avoids the O(n) shifting an ArrayList removal would cost on
+                 * every single segment.
+                 */
+                while (!_inSeqRecvQueue.isEmpty()) {
+                    Segment s = _inSeqRecvQueue.peekFirst();
 
                     if (s instanceof RSTSegment) {
-                        it.remove();
+                        _inSeqRecvQueue.pollFirst();
                         break;
                     }
                     else if (s instanceof FINSegment) {
                         if (totalBytes <= 0) {
-                            it.remove();
+                            _inSeqRecvQueue.pollFirst();
                             return -1; /* EOF */
                         }
                         break;
@@ -873,7 +890,10 @@ public class ReliableSocket extends Socket
 
                         System.arraycopy(data, 0, b, off+totalBytes, data.length);
                         totalBytes += data.length;
-                        it.remove();
+                        _inSeqRecvQueue.pollFirst();
+                    }
+                    else {
+                        _inSeqRecvQueue.pollFirst();
                     }
                 }
 
@@ -957,6 +977,27 @@ public class ReliableSocket extends Socket
     }
 
     /**
+     * Returns the retransmission timeout to stamp on a segment that is being
+     * (re)transmitted right now: the current RTO estimate scaled by the
+     * segment's accumulated exponential backoff.
+     * <p>
+     * The backoff used to be computed and then discarded, while the deadline
+     * was always stamped with the bare RTO, so a segment that had already
+     * timed out was retried at the very same interval as the first attempt
+     * and the retries piled onto an already congested path. The lower bound
+     * needs no clamp: updateRttSample() already keeps _rto at or above
+     * MIN_RTO and the shift is never negative.
+     *
+     * @param segment the segment about to go out.
+     * @return the effective timeout in milliseconds.
+     */
+    private int rtoFor(Segment segment)
+    {
+        long rto = ((long) _rto) << segment.rtoShift();
+        return (int) (rto > MAX_RTO ? MAX_RTO : rto);
+    }
+
+    /**
      * Sends a segment piggy-backing any pending acknowledgments.
      *
      * @param  s the segment.
@@ -980,6 +1021,7 @@ public class ReliableSocket extends Socket
             log("sent " + s);
         }
 
+        s.markSent(System.currentTimeMillis(), rtoFor(s));
         sendSegmentImpl(s);
     }
 
@@ -1041,20 +1083,22 @@ public class ReliableSocket extends Socket
 
             _counters.incOutstandingSegsCounter();
             _unackedSentQueue.add(segment);
+
+            /*
+             * Stamp the deadline here, before arming, and not leave it to
+             * sendSegment() below: armRetransmission() skips segments whose
+             * deadline is still Long.MAX_VALUE, so arming an unstamped
+             * segment silently dropped it from the retransmission schedule
+             * and its first transmission was never retried. That is why a
+             * lost SYN used to hang in SYN_SENT until connect()'s own
+             * timeout instead of being retransmitted.
+             */
+            segment.markSent(System.currentTimeMillis(), rtoFor(segment));
+            armRetransmission(segment);
         }
 
         if (_closed) {
             throw new SocketException("Socket is closed");
-        }
-
-        /* Re-start retransmission timer */
-        if (!(segment instanceof EAKSegment) && !(segment instanceof ACKSegment)) {
-            synchronized (_retransmissionTimer) {
-                if (_retransmissionTimer.isIdle()) {
-                    _retransmissionTimer.schedule(_profile.retransmissionTimeout(),
-                                                  _profile.retransmissionTimeout());
-                }
-            }
         }
 
         sendSegment(segment);
@@ -1091,7 +1135,12 @@ public class ReliableSocket extends Socket
             return true;
         }
 
+        segment.markRetransmitted();
         sendSegment(segment);
+
+        synchronized (_unackedSentQueue) {
+            armRetransmission(segment);
+        }
 
         if (segment instanceof DATSegment) {
              synchronized (_listeners) {
@@ -1104,6 +1153,92 @@ public class ReliableSocket extends Socket
         }
 
         return false;
+    }
+
+    /**
+     * Puts a segment into the retransmission schedule, ordered by its
+     * deadline, and makes sure the retransmission timer is armed for the
+     * earliest one.
+     * <p>
+     * Must be called while holding the _unackedSentQueue monitor.
+     * Re-arming an already scheduled segment is a no-op: the heap entry is
+     * replaced only when the deadline actually moved, so that a burst of
+     * retransmissions does not grow the heap.
+     */
+    private void armRetransmission(Segment segment)
+    {
+        _retxQueue.remove(segment);
+        if (segment.deadline() != Long.MAX_VALUE) {
+            _retxQueue.add(segment);
+        }
+
+        Segment head = _retxQueue.peek();
+        if (head == null) {
+            _retransmissionTimer.cancel();
+            return;
+        }
+
+        long delay = head.deadline() - System.currentTimeMillis();
+        if (delay < 1) {
+            delay = 1;
+        }
+
+        if (_retransmissionTimer.isIdle()) {
+            _retransmissionTimer.schedule(delay);
+        }
+    }
+
+    /**
+     * Re-arms the retransmission timer for the earliest deadline still
+     * pending. Must be called while holding the _unackedSentQueue monitor.
+     */
+    private void rearmRetransmission()
+    {
+        Segment head = _retxQueue.peek();
+        if (head == null) {
+            _retransmissionTimer.cancel();
+            return;
+        }
+
+        long delay = head.deadline() - System.currentTimeMillis();
+        if (delay < 1) {
+            delay = 1;
+        }
+
+        _retransmissionTimer.cancel();
+        _retransmissionTimer.schedule(delay);
+    }
+
+    /**
+     * Folds a round trip time sample into the smoothed estimators and
+     * recomputes the retransmission timeout (RFC 6298). Must be called while
+     * holding the _unackedSentQueue monitor.
+     */
+    private void updateRttSample(long rttMillis)
+    {
+        if (rttMillis < 1) {
+            rttMillis = 1;
+        }
+
+        if (_srtt < 0) {
+            _srtt = rttMillis;
+            _rttvar = rttMillis / 2;
+        }
+        else {
+            long delta = Math.abs(_srtt - rttMillis);
+            _rttvar = (3 * _rttvar + delta) / 4;
+            _srtt = (7 * _srtt + rttMillis) / 8;
+        }
+
+        long rto = _srtt + 4 * _rttvar;
+        if (rto < MIN_RTO) {
+            rto = MIN_RTO;
+        }
+        else if (rto > MAX_RTO) {
+            rto = MAX_RTO;
+        }
+
+        _rto = (int) rto;
     }
 
     /**
@@ -1348,20 +1483,29 @@ public class ReliableSocket extends Socket
         synchronized (_unackedSentQueue) {
 
             /* Removed acknowledged segments from sent queue */
+            int removed = 0;
             for (it = _unackedSentQueue.iterator(); it.hasNext(); ) {
                 Segment s = (Segment) it.next();
                 if ((compareSequenceNumbers(s.seq(), lastInSequence) <= 0)) {
                     it.remove();
+                    s.markAcked();
+                    s.clearBackOff();
+                    removed++;
                     continue;
                 }
 
                 for (int i = 0; i < acks.length; i++) {
                     if ((compareSequenceNumbers(s.seq(), acks[i]) == 0)) {
                         it.remove();
+                        s.markAcked();
+                        s.clearBackOff();
+                        removed++;
                         break;
                     }
                 }
             }
+
+            _counters.decOutstandingSegsCounter(removed);
 
             /* Retransmit segments */
             it = _unackedSentQueue.iterator();
@@ -1377,6 +1521,14 @@ public class ReliableSocket extends Socket
                         xcp.printStackTrace();
                     }
                 }
+            }
+
+            if (_unackedSentQueue.isEmpty()) {
+                _retxQueue.clear();
+                _retransmissionTimer.cancel();
+            }
+            else {
+                rearmRetransmission();
             }
 
             _unackedSentQueue.notifyAll();
@@ -1610,27 +1762,76 @@ public class ReliableSocket extends Socket
             return;
         }
 
-        _counters.getAndResetOutstandingSegsCounter();
-
         if (_state == SYN_RCVD) {
             _state = ESTABLISHED;
             connectionOpened();
         }
 
+        boolean fastRetransmit = false;
+        boolean limitExceeded = false;
+
         synchronized (_unackedSentQueue) {
+            Segment newestAcked = null;
+            int removed = 0;
+
             Iterator<Segment> it = _unackedSentQueue.iterator();
             while (it.hasNext()) {
                 Segment s = (Segment) it.next();
                 if (compareSequenceNumbers(s.seq(), ackn) <= 0) {
                     it.remove();
+                    s.markAcked();
+                    s.clearBackOff();
+                    newestAcked = s;
+                    removed++;
+                }
+            }
+
+            _counters.decOutstandingSegsCounter(removed);
+
+            /*
+             * An ACK that does not advance the acknowledgment point is a
+             * duplicate: three of them in a row mean the segment right after
+             * the acknowledged one was most likely lost, so retransmit it
+             * right away instead of waiting for its timeout to expire.
+             */
+            if (!_dupAckValid || compareSequenceNumbers(ackn, _lastAckn) != 0) {
+                _lastAckn = ackn;
+                _dupAckValid = true;
+                _dupAcks = 0;
+            }
+            else if (++_dupAcks >= FAST_RETRANSMIT_THRESHOLD) {
+                _dupAcks = 0;
+                fastRetransmit = true;
+            }
+
+            if (newestAcked != null && !newestAcked.wasRetransmitted()) {
+                updateRttSample(System.currentTimeMillis() - newestAcked.sentTime());
+            }
+
+            if (fastRetransmit && !_unackedSentQueue.isEmpty()) {
+                Segment lost = _unackedSentQueue.get(0);
+                lost.backOffRto(FAST_RETRANSMIT_BACKOFF_SHIFT);
+                try {
+                    limitExceeded = retransmitSegment(lost);
+                }
+                catch (IOException xcp) {
+                    xcp.printStackTrace();
                 }
             }
 
             if (_unackedSentQueue.isEmpty()) {
+                _retxQueue.clear();
                 _retransmissionTimer.cancel();
+            }
+            else {
+                rearmRetransmission();
             }
 
             _unackedSentQueue.notifyAll();
+        }
+
+        if (limitExceeded) {
+            connectionFailure();
         }
     }
 
@@ -1668,9 +1869,31 @@ public class ReliableSocket extends Socket
         throws IOException
     {
         try {
-            DatagramPacket packet = new DatagramPacket(
-                    s.getBytes(), s.length(), _endpoint);
-            _sock.send(packet);
+            /*
+             * The serialization buffer and the packet are reused across
+             * calls. Sends are serialized because this method is reached
+             * concurrently from the application thread, the socket reader
+             * thread and the timer threads.
+             */
+            synchronized (_sendLock) {
+                int len = s.length();
+                if (_sendbuffer.length < len) {
+                    _sendbuffer = new byte[len];
+                    _sendPacket = null;
+                }
+
+                if (_sendPacket == null) {
+                    _sendPacket = new DatagramPacket(_sendbuffer, len, _endpoint);
+                }
+                else {
+                    _sendPacket.setData(_sendbuffer);
+                    _sendPacket.setLength(len);
+                    _sendPacket.setSocketAddress(_endpoint);
+                }
+
+                s.writeTo(_sendbuffer, 0);
+                _sock.send(_sendPacket);
+            }
         }
         catch (IOException xcp) {
         }
@@ -1687,9 +1910,12 @@ public class ReliableSocket extends Socket
         throws IOException
     {
         try {
-            DatagramPacket packet = new DatagramPacket(_recvbuffer, _recvbuffer.length);
-            _sock.receive(packet);
-            return Segment.parse(packet.getData(), 0, packet.getLength());
+            if (_recvPacket == null) {
+                _recvPacket = new DatagramPacket(_recvbuffer, _recvbuffer.length);
+            }
+
+            _sock.receive(_recvPacket);
+            return Segment.parse(_recvbuffer, 0, _recvPacket.getLength());
         }
         catch (IOException ioXcp) {
             if (!isClosed()) {
@@ -1824,6 +2050,16 @@ public class ReliableSocket extends Socket
     protected ReliableSocketOutputStream _out;
 
     private byte[]  _recvbuffer = new byte[65535];
+    private DatagramPacket _recvPacket;
+
+    /*
+     * Outgoing packets are serialized into a single reusable buffer. The
+     * buffer is reallocated when a segment larger than the negotiated
+     * maximum shows up (a peer proposing a bigger maxSegmentSize).
+     */
+    private byte[] _sendbuffer = new byte[0];
+    private DatagramPacket _sendPacket;
+    private final Object _sendLock = new Object();
 
     private volatile boolean _closed = false;
     private boolean _connected = false;
@@ -1847,15 +2083,40 @@ public class ReliableSocket extends Socket
 
     private ArrayList<Segment> _unackedSentQueue = new ArrayList<Segment>(); /* Unacknowledged segments send queue */
     private ArrayList<Segment> _outSeqRecvQueue  = new ArrayList<Segment>(); /* Out-of-sequence received segments queue */
-    private ArrayList<Segment> _inSeqRecvQueue   = new ArrayList<Segment>(); /* In-sequence received segments queue */
+    private ArrayDeque<Segment> _inSeqRecvQueue  = new ArrayDeque<Segment>(); /* In-sequence received segments queue */
+
+    /*
+     * Retransmission schedule: the unacknowledged segments ordered by the
+     * instant at which their timeout retransmission becomes due. Guarded by
+     * the _unackedSentQueue monitor.
+     */
+    private final PriorityQueue<Segment> _retxQueue = new PriorityQueue<Segment>(16,
+            new Comparator<Segment>() {
+                public int compare(Segment a, Segment b) {
+                    return Long.compare(a.deadline(), b.deadline());
+                }
+            });
+
+    /*
+     * Round trip time estimation (RFC 6298). _srtt < 0 means "no sample
+     * taken yet", in which case the profile's retransmission timeout is used
+     * as the initial RTO. Guarded by the _unackedSentQueue monitor.
+     */
+    private long _srtt = -1;
+    private long _rttvar = 0;
+    private int _rto;
+
+    private int _dupAcks = 0;
+    private int _lastAckn = -1;
+    private boolean _dupAckValid = false;
 
     private Object _recvQueueLock = new Object();  /* Lock for receiver queues */
     private Counters _counters    = new Counters(); /* Sequence number, ack counters, etc. */
 
     private Thread _sockThread    = new ReliableSocketThread();
 
-    private int _sendQueueSize = 32; /* Maximum number of received segments */
-    private int _recvQueueSize = 32; /* Maximum number of sent segments */
+    private int _sendQueueSize = ReliableSocketProfile.MAX_SEND_QUEUE_SIZE;
+    private int _recvQueueSize = ReliableSocketProfile.MAX_RECV_QUEUE_SIZE;
 
     private int _sendBufferSize;
     private int _recvBufferSize;
@@ -1869,13 +2130,11 @@ public class ReliableSocket extends Socket
         new Timer("ReliableSocket-NullSegmentTimer", new NullSegmentTimerTask());
 
     /*
-     * This timer is re-started every time a data, null, or reset
-     * segment is sent and there is not a segment currently being timed.
-     * If an acknowledgment for this data segment is not received by
-     * the time the timer expires, all segments that have been sent but
-     * not acknowledged are retransmitted. The Retransmission timer is
-     * re-started when the timed segment is received, if there is still
-     * one or more packets that have been sent but not acknowledged.
+     * This timer holds the retransmission schedule (_retxQueue). It is armed
+     * as a one-shot for the earliest pending deadline and re-armed by
+     * RetransmissionTimerTask itself, so each unacknowledged segment is
+     * retransmitted on its own exponentially backed-off timeout rather than
+     * every unacknowledged segment being resent on a single fixed tick.
      */
     private Timer _retransmissionTimer =
         new Timer("ReliableSocket-RetransmissionTimer", new RetransmissionTimerTask());
@@ -1912,6 +2171,24 @@ public class ReliableSocket extends Socket
      */
     private static final long SYN_RCVD_TIMEOUT = 30000;
 
+    /*
+     * Number of consecutive acknowledgments that do not advance the
+     * acknowledgment point before the oldest unacknowledged segment is
+     * retransmitted without waiting for its timeout.
+     */
+    private static final int FAST_RETRANSMIT_THRESHOLD = 3;
+
+    /*
+     * A fast retransmission happens without any evidence of congestion, so
+     * its timeout is not backed off at all (MAX_RTO_BACKOFF_SHIFT instead).
+     */
+    private static final int FAST_RETRANSMIT_BACKOFF_SHIFT = 0;
+
+    /* Bounds of the RTO computed from the round trip time estimators. */
+    private static final int MAX_RTO_BACKOFF_SHIFT = 4;
+    private static final long MIN_RTO = 50;
+    private static final long MAX_RTO = 5000;
+
     private static final int MAX_SEQUENCE_NUMBER        = 255;
 
     private static final int CLOSED      = 0; /* There is not an active or pending connection */
@@ -1945,77 +2222,83 @@ public class ReliableSocket extends Socket
             return _seqn;
         }
 
-        public synchronized int setLastInSequence(int n)
+        /*
+         * _lastInSequence is written only from the socket reader thread
+         * (handleSYNSegment/handleSegment/checkRecvQueues), so a volatile
+         * read is enough and keeps the per-segment hot path lock free.
+         */
+        public int setLastInSequence(int n)
         {
             _lastInSequence = n;
             return _lastInSequence;
         }
 
-        public synchronized int getLastInSequence()
+        public int getLastInSequence()
         {
             return _lastInSequence;
         }
 
-        public synchronized void incCumulativeAckCounter()
+        public void incCumulativeAckCounter()
         {
-            _cumAckCounter++;
+            _cumAckCounter.incrementAndGet();
         }
 
-        public synchronized int getCumulativeAckCounter()
+        public int getCumulativeAckCounter()
         {
-            return _cumAckCounter;
+            return _cumAckCounter.get();
         }
 
-        public synchronized int getAndResetCumulativeAckCounter()
+        public int getAndResetCumulativeAckCounter()
         {
-            int tmp = _cumAckCounter;
-            _cumAckCounter = 0;
-            return tmp;
+            return _cumAckCounter.getAndSet(0);
         }
 
-        public synchronized void incOutOfSequenceCounter()
+        public void incOutOfSequenceCounter()
         {
-            _outOfSeqCounter++;
+            _outOfSeqCounter.incrementAndGet();
         }
 
-        public synchronized int getOutOfSequenceCounter()
+        public int getOutOfSequenceCounter()
         {
-            return _outOfSeqCounter;
+            return _outOfSeqCounter.get();
         }
 
-        public synchronized int getAndResetOutOfSequenceCounter()
+        public int getAndResetOutOfSequenceCounter()
         {
-            int tmp = _outOfSeqCounter;
-            _outOfSeqCounter = 0;
-            return tmp;
+            return _outOfSeqCounter.getAndSet(0);
         }
 
-        public synchronized void incOutstandingSegsCounter()
+        public void incOutstandingSegsCounter()
         {
-            _outSegsCounter++;
+            _outSegsCounter.incrementAndGet();
         }
 
-        public synchronized int getOutstandingSegsCounter()
+        public int getOutstandingSegsCounter()
         {
-            return _outSegsCounter;
+            return _outSegsCounter.get();
         }
 
-        public synchronized int getAndResetOutstandingSegsCounter()
+        /**
+         * Accounts for the segments that just left the unacknowledged queue.
+         * Resetting the counter instead would silently widen the flow control
+         * window by however many segments were still in flight.
+         */
+        public void decOutstandingSegsCounter(int n)
         {
-            int tmp = _outSegsCounter;
-            _outSegsCounter = 0;
-            return tmp;
+            if (n > 0) {
+                _outSegsCounter.addAndGet(-n);
+            }
         }
 
-        public synchronized void reset()
+        public void reset()
         {
-            _outOfSeqCounter = 0;
-            _outSegsCounter  = 0;
-            _cumAckCounter   = 0;
+            _outOfSeqCounter.set(0);
+            _outSegsCounter.set(0);
+            _cumAckCounter.set(0);
         }
 
         private int _seqn;             /* Segment sequence number */
-        private int _lastInSequence;   /* Last in-sequence received segment */
+        private volatile int _lastInSequence;   /* Last in-sequence received segment */
 
         /*
          * The receiver maintains a counter of unacknowledged segments received
@@ -2026,7 +2309,7 @@ public class ReliableSocket extends Socket
          * segments. The recommended value for the cumulative acknowledge counter
          * is 3.
          */
-        private int _cumAckCounter; /* Cumulative acknowledge counter */
+        private final AtomicInteger _cumAckCounter = new AtomicInteger(); /* Cumulative acknowledge counter */
 
         /*
          * The receiver maintains a counter of the number of segments that have
@@ -2036,14 +2319,14 @@ public class ReliableSocket extends Socket
          * is sent to the transmitter. The counter is then reset to zero. The
          * recommended value for the out-of-sequence acknowledgments counter is 3.
          */
-        private int _outOfSeqCounter; /* Out-of-sequence acknowledgments counter */
+        private final AtomicInteger _outOfSeqCounter = new AtomicInteger(); /* Out-of-sequence acknowledgments counter */
 
         /*
          * The transmitter maintains a counter of the number of segments that
          * have been sent without getting an acknowledgment. This is used
          * by the receiver as a mean of flow control.
          */
-        private int _outSegsCounter; /* Outstanding segments counter */
+        private final AtomicInteger _outSegsCounter = new AtomicInteger(); /* Outstanding segments counter */
     }
 
     private class ReliableSocketThread extends Thread
@@ -2058,9 +2341,9 @@ public class ReliableSocket extends Socket
         {
             Segment segment;
             try {
-                while ((segment = receiveSegment()) != null) {
+            while ((segment = receiveSegment()) != null) {
 
-                    if (segment instanceof SYNSegment) {
+                if (segment instanceof SYNSegment) {
                         handleSYNSegment((SYNSegment) segment);
                     }
                     else if (segment instanceof EAKSegment) {
@@ -2107,17 +2390,47 @@ public class ReliableSocket extends Socket
         public void run()
         {
             boolean limitExceeded = false;
+            long now = System.currentTimeMillis();
 
             synchronized (_unackedSentQueue) {
-                Iterator<Segment> it = _unackedSentQueue.iterator();
-                while (it.hasNext() && !limitExceeded) {
-                    Segment s = (Segment) it.next();
+                /*
+                 * Only the segments whose own deadline has expired are
+                 * retransmitted. Previously every unacknowledged segment was
+                 * resent on each tick, which with a large window turns a
+                 * single loss into a storm that congests the path even
+                 * further.
+                 */
+                while (true) {
+                    Segment s = _retxQueue.peek();
+                    if (s == null || s.deadline() > now) {
+                        break;
+                    }
+
+                    _retxQueue.poll();
+
+                    if (s.isAcked()) {
+                        continue;
+                    }
+
                     try {
+                        s.backOffRto(MAX_RTO_BACKOFF_SHIFT);
                         limitExceeded = retransmitSegment(s);
                     }
                     catch (IOException xcp) {
                         xcp.printStackTrace();
                     }
+
+                    if (limitExceeded) {
+                        break;
+                    }
+                }
+
+                if (_unackedSentQueue.isEmpty()) {
+                    _retxQueue.clear();
+                    _retransmissionTimer.cancel();
+                }
+                else {
+                    rearmRetransmission();
                 }
             }
 

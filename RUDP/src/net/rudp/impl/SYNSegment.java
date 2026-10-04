@@ -172,6 +172,42 @@ public class SYNSegment extends Segment
         return buffer;
     }
 
+    /**
+     * Writes the full SYN segment (header + negotiated parameters) into the
+     * caller-supplied buffer. The base Segment.writeTo() only emits the 6-byte
+     * header, so subclasses must override this; mirroring getBytes() here keeps
+     * the wire format identical while avoiding a per-packet byte[] allocation.
+     */
+    public int writeTo(byte[] buffer, int off)
+    {
+        // Zero the whole segment so a reused send buffer cannot leak stale bytes
+        // into the unused trailing positions (matches the fresh allocation in getBytes()).
+        for (int i = 0; i < length(); i++) {
+            buffer[off + i] = 0;
+        }
+
+        super.writeTo(buffer, off);
+
+        buffer[off + 4] = (byte) ((_version << 4) & 0xFF);
+        buffer[off + 5] = (byte) (_maxseg & 0xFF);
+        buffer[off + 6] = (byte) (_optflags & 0xFF);
+        buffer[off + 7] = 0; /* spare */
+        buffer[off + 8]  = (byte) ((_maxsegsize >>> 8) & 0xFF);
+        buffer[off + 9]  = (byte) ((_maxsegsize >>> 0) & 0xFF);
+        buffer[off + 10] = (byte) ((_rettoval >>> 8) & 0xFF);
+        buffer[off + 11] = (byte) ((_rettoval >>> 0) & 0xFF);
+        buffer[off + 12] = (byte) ((_cumacktoval >>> 8) & 0xFF);
+        buffer[off + 13] = (byte) ((_cumacktoval >>> 0) & 0xFF);
+        buffer[off + 14] = (byte) ((_niltoval >>> 8) & 0xFF);
+        buffer[off + 15] = (byte) ((_niltoval >>> 0) & 0xFF);
+        buffer[off + 16] = (byte) (_maxret & 0xFF);
+        buffer[off + 17] = (byte) (_maxcumack & 0xFF);
+        buffer[off + 18] = (byte) (_maxoutseq & 0xFF);
+        buffer[off + 19] = (byte) (_maxautorst & 0xFF);
+
+        return length();
+    }
+
     protected void parseBytes(byte[] buffer, int off, int len)
     {
         super.parseBytes(buffer, off, len);

@@ -40,6 +40,7 @@ import java.net.Socket;
 import java.net.SocketAddress;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
 
@@ -453,14 +454,14 @@ public class ReliableServerSocket extends ServerSocket
 
         protected void init(DatagramSocket sock, ReliableSocketProfile profile)
         {
-            _queue = new ArrayList<Segment>();
+            _queue = new ArrayDeque<Segment>();
             super.init(sock, profile);
         }
 
         protected Segment receiveSegmentImpl()
         {
             synchronized (_queue) {
-                while (_queue.isEmpty()) {
+                while (_queue.isEmpty() && !_localClosed) {
                     try {
                         _queue.wait();
                     }
@@ -469,14 +470,18 @@ public class ReliableServerSocket extends ServerSocket
                     }
                 }
 
-                return (Segment) _queue.remove(0);
+                if (_localClosed && _queue.isEmpty()) {
+                    return null;
+                }
+
+                return (Segment) _queue.pollFirst();
             }
         }
 
         public void segmentReceived(Segment s)
         {
             synchronized (_queue) {
-                _queue.add(s);
+                _queue.offerLast(s);
                 _queue.notify();
             }
         }
@@ -484,8 +489,11 @@ public class ReliableServerSocket extends ServerSocket
         protected void closeSocket()
         {
             synchronized (_queue) {
+                // Drop any pending segments and wake up the reading thread.
+                // _localClosed (checked by receiveSegmentImpl) is what
+                // terminates it; the queue itself must stay free of nulls.
                 _queue.clear();
-                _queue.add(null);
+                _localClosed = true;
                 _queue.notify();
             }
         }
@@ -504,7 +512,11 @@ public class ReliableServerSocket extends ServerSocket
             return _endpoint;
         }
 
-        private ArrayList<Segment> _queue;
+        private ArrayDeque<Segment> _queue;
+
+        // Named _localClosed (not _closed) to avoid shadowing the private
+        // _closed field inherited from ReliableSocket.
+        private boolean _localClosed = false;
     }
 
     private class StateListener implements ReliableSocketStateListener

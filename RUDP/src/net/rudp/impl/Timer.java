@@ -61,6 +61,16 @@ public class Timer extends Thread
                 if (_stopped) {
                     break;
                 }
+
+                /*
+                 * A schedule without a period is one-shot: clear the flag
+                 * before running the task so that this thread parks again
+                 * afterwards instead of re-running the task in a tight loop.
+                 * The task itself may re-arm the timer with schedule().
+                 */
+                if (_period == 0) {
+                    _scheduled = false;
+                }
             }
 
             synchronized (_lock) {

@@ -6,3 +6,6 @@
 .project
 /classes
 rudp-SNAPSHOT.jar
+
+# Test classes: run_tests.sh compiles the examples in place under src/.
+*.class
