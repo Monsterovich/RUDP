@@ -110,6 +110,11 @@ public class EAKSegment extends ACKSegment
     protected void parseBytes(byte[] buffer, int off, int len)
     {
         super.parseBytes(buffer, off, len);
+
+        if (len <= RUDP_HEADER_LEN) {
+            throw new IllegalArgumentException("Invalid EAK segment");
+        }
+
         _acks = new int[len - RUDP_HEADER_LEN];
         for (int i = 0; i < _acks.length; i++) {
             _acks[i] = (buffer[off + 4 + i] & 0xFF);

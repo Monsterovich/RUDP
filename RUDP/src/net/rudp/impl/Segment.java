@@ -221,6 +221,11 @@ public abstract class Segment
             segment = new NULSegment();
         }
         else if ((flags & EAK_FLAG) != 0) {
+            /* An EAK always carries at least one out-of-sequence ack number. */
+            if (len <= RUDP_HEADER_LEN) {
+                throw new IllegalArgumentException("Invalid EAK segment");
+            }
+
             segment = new EAKSegment();
         }
         else if ((flags & RST_FLAG) != 0) {

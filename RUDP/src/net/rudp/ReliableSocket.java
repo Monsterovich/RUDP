@@ -2339,28 +2339,46 @@ public class ReliableSocket extends Socket
 
         public void run()
         {
-            Segment segment;
             try {
-            while ((segment = receiveSegment()) != null) {
+                while (true) {
+                    try {
+                        Segment segment = receiveSegment();
 
-                if (segment instanceof SYNSegment) {
-                        handleSYNSegment((SYNSegment) segment);
-                    }
-                    else if (segment instanceof EAKSegment) {
-                        handleEAKSegment((EAKSegment) segment);
-                    }
-                    else if (segment instanceof ACKSegment) {
-                        // do nothing.
-                    }
-                    else {
-                        handleSegment(segment);
-                    }
+                        if (segment == null) {
+                            break;
+                        }
 
-                    checkAndGetAck(segment);
+                        if (segment instanceof SYNSegment) {
+                            handleSYNSegment((SYNSegment) segment);
+                        }
+                        else if (segment instanceof EAKSegment) {
+                            handleEAKSegment((EAKSegment) segment);
+                        }
+                        else if (segment instanceof ACKSegment) {
+                            // do nothing.
+                        }
+                        else {
+                            handleSegment(segment);
+                        }
+
+                        checkAndGetAck(segment);
+                    }
+                    catch (IllegalArgumentException xcp) {
+                        /* A malformed segment says nothing about the rest of the
+                           connection, so drop it and keep reading. */
+                        xcp.printStackTrace();
+                    }
                 }
             }
             catch (IOException xcp) {
                 xcp.printStackTrace();
+            }
+            catch (RuntimeException xcp) {
+                /* This thread is the socket's only reader, so dying here would
+                   leave callers blocked forever on a socket that still reports
+                   itself connected. Fail the connection instead so they see it. */
+                xcp.printStackTrace();
+                connectionFailure();
             }
         }
     }
