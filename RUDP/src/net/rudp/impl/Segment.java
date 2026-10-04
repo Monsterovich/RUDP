@@ -209,7 +209,15 @@ public abstract class Segment
     {
         Segment segment = null;
 
-        if (len < RUDP_HEADER_LEN) {
+        /*
+         * Checked here rather than left to the field reads below: a caller
+         * that hands over a buffer too short for the header or for the length
+         * it claims must be told the segment is invalid, not get an
+         * ArrayIndexOutOfBoundsException out of a byte access and mistake it
+         * for a corrupted datagram. A len shorter than the buffer is fine -
+         * that is a segment followed by unrelated bytes.
+         */
+        if (off < 0 || len < RUDP_HEADER_LEN || off > bytes.length - len) {
             throw new IllegalArgumentException("Invalid segment");
         }
 
