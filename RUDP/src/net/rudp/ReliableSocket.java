@@ -59,6 +59,7 @@ import net.rudp.impl.EAKSegment;
 import net.rudp.impl.FINSegment;
 import net.rudp.impl.NULSegment;
 import net.rudp.impl.RSTSegment;
+import net.rudp.impl.RtoEstimator;
 import net.rudp.impl.SYNSegment;
 import net.rudp.impl.Segment;
 import net.rudp.impl.Timer;
@@ -214,10 +215,31 @@ public class ReliableSocket extends Socket
      */
     protected ReliableSocket(DatagramSocket sock, ReliableSocketProfile profile)
     {
+        this(sock, profile, Clock.SYSTEM);
+    }
+
+    /**
+     * Creates a RUDP socket and attaches it to the underlying
+     * datagram socket using the given RUDP parameters, taking every
+     * timestamp from the given clock.
+     * <p>
+     * The clock is installed before init() runs, so it is already in place
+     * when the socket thread and the timer threads start.
+     *
+     * @param sock the datagram socket.
+     * @param profile the socket profile.
+     * @param clock the source of wall clock time.
+     */
+    protected ReliableSocket(DatagramSocket sock, ReliableSocketProfile profile, Clock clock)
+    {
         if (sock == null) {
             throw new NullPointerException("sock");
         }
+        if (clock == null) {
+            throw new NullPointerException("clock");
+        }
 
+        _clock = clock;
         init(sock, profile);
     }
 
@@ -239,7 +261,7 @@ public class ReliableSocket extends Socket
         _sendQueueSize = _profile.maxSendQueueSize();
         _recvQueueSize = _profile.maxRecvQueueSize();
 
-        _rto = _profile.retransmissionTimeout();
+        _rto = new RtoEstimator(_profile.retransmissionTimeout());
         _sendbuffer = new byte[_profile.maxSegmentSize()];
 
         /* Register shutdown hook */
@@ -294,7 +316,7 @@ public class ReliableSocket extends Socket
 
         // Synchronize sequence numbers
         _state = SYN_SENT;
-        Random rand = new Random(System.currentTimeMillis());
+        Random rand = new Random(now());
         Segment syn = new SYNSegment(_counters.setSequenceNumber(rand.nextInt(MAX_SEQUENCE_NUMBER)),
                 _profile.maxOutstandingSegs(),
                 _profile.maxSegmentSize(),
@@ -317,9 +339,9 @@ public class ReliableSocket extends Socket
                         wait();
                     }
                     else {
-                        long startTime = System.currentTimeMillis();
+                        long startTime = now();
                         wait(timeout);
-                        if (System.currentTimeMillis() - startTime >= timeout) {
+                        if (now() - startTime >= timeout) {
                             timedout = true;
                         }
                     }
@@ -731,7 +753,7 @@ public class ReliableSocket extends Socket
 
         // Synchronize sequence numbers
         _state = SYN_SENT;
-        Random rand = new Random(System.currentTimeMillis());
+        Random rand = new Random(now());
         Segment syn = new SYNSegment(_counters.setSequenceNumber(rand.nextInt(MAX_SEQUENCE_NUMBER)),
                 _profile.maxOutstandingSegs(),
                 _profile.maxSegmentSize(),
@@ -845,9 +867,9 @@ public class ReliableSocket extends Socket
                             _recvQueueLock.wait();
                         }
                         else {
-                            long startTime = System.currentTimeMillis();
+                            long startTime = now();
                             _recvQueueLock.wait(_timeout);
-                            if ((System.currentTimeMillis() - startTime) >= _timeout) {
+                            if ((now() - startTime) >= _timeout) {
                                 throw new SocketTimeoutException();
                             }
                         }
@@ -985,7 +1007,7 @@ public class ReliableSocket extends Socket
      * was always stamped with the bare RTO, so a segment that had already
      * timed out was retried at the very same interval as the first attempt
      * and the retries piled onto an already congested path. The lower bound
-     * needs no clamp: updateRttSample() already keeps _rto at or above
+     * needs no clamp: updateRttSample() already keeps the RTO at or above
      * MIN_RTO and the shift is never negative.
      *
      * @param segment the segment about to go out.
@@ -993,8 +1015,7 @@ public class ReliableSocket extends Socket
      */
     private int rtoFor(Segment segment)
     {
-        long rto = ((long) _rto) << segment.rtoShift();
-        return (int) (rto > MAX_RTO ? MAX_RTO : rto);
+        return _rto.rtoFor(segment.rtoShift());
     }
 
     /**
@@ -1021,7 +1042,7 @@ public class ReliableSocket extends Socket
             log("sent " + s);
         }
 
-        s.markSent(System.currentTimeMillis(), rtoFor(s));
+        s.markSent(now(), rtoFor(s));
         sendSegmentImpl(s);
     }
 
@@ -1093,7 +1114,7 @@ public class ReliableSocket extends Socket
              * lost SYN used to hang in SYN_SENT until connect()'s own
              * timeout instead of being retransmitted.
              */
-            segment.markSent(System.currentTimeMillis(), rtoFor(segment));
+            segment.markSent(now(), rtoFor(segment));
             armRetransmission(segment);
         }
 
@@ -1178,7 +1199,7 @@ public class ReliableSocket extends Socket
             return;
         }
 
-        long delay = head.deadline() - System.currentTimeMillis();
+        long delay = head.deadline() - now();
         if (delay < 1) {
             delay = 1;
         }
@@ -1200,7 +1221,7 @@ public class ReliableSocket extends Socket
             return;
         }
 
-        long delay = head.deadline() - System.currentTimeMillis();
+        long delay = head.deadline() - now();
         if (delay < 1) {
             delay = 1;
         }
@@ -1210,35 +1231,13 @@ public class ReliableSocket extends Socket
     }
 
     /**
-     * Folds a round trip time sample into the smoothed estimators and
-     * recomputes the retransmission timeout (RFC 6298). Must be called while
-     * holding the _unackedSentQueue monitor.
+     * Folds a round trip time sample into the retransmission timeout
+     * estimator (RFC 6298). Must be called while holding the
+     * _unackedSentQueue monitor.
      */
     private void updateRttSample(long rttMillis)
     {
-        if (rttMillis < 1) {
-            rttMillis = 1;
-        }
-
-        if (_srtt < 0) {
-            _srtt = rttMillis;
-            _rttvar = rttMillis / 2;
-        }
-        else {
-            long delta = Math.abs(_srtt - rttMillis);
-            _rttvar = (3 * _rttvar + delta) / 4;
-            _srtt = (7 * _srtt + rttMillis) / 8;
-        }
-
-        long rto = _srtt + 4 * _rttvar;
-        if (rto < MIN_RTO) {
-            rto = MIN_RTO;
-        }
-        else if (rto > MAX_RTO) {
-            rto = MAX_RTO;
-        }
-
-        _rto = (int) rto;
+        _rto.updateSample(rttMillis);
     }
 
     /**
@@ -1413,7 +1412,7 @@ public class ReliableSocket extends Socket
                         _keepAliveTimer.schedule(SYN_RCVD_TIMEOUT);
                     }
 
-                    Random rand = new Random(System.currentTimeMillis());
+                    Random rand = new Random(now());
                     _profile = new ReliableSocketProfile(
                             _sendQueueSize,
                             _recvQueueSize,
@@ -1805,7 +1804,7 @@ public class ReliableSocket extends Socket
             }
 
             if (newestAcked != null && !newestAcked.wasRetransmitted()) {
-                updateRttSample(System.currentTimeMillis() - newestAcked.sentTime());
+                updateRttSample(now() - newestAcked.sentTime());
             }
 
             if (fastRetransmit && !_unackedSentQueue.isEmpty()) {
@@ -2014,6 +2013,16 @@ public class ReliableSocket extends Socket
     }
 
     /**
+     * Returns this socket's current time, i.e. the injected clock's reading.
+     *
+     * @return the current time in milliseconds.
+     */
+    protected long now()
+    {
+        return _clock.currentTimeMillis();
+    }
+
+    /**
      * Computes the consecutive sequence number.
      *
      * @return the next number in the sequence.
@@ -2048,6 +2057,13 @@ public class ReliableSocket extends Socket
     protected SocketAddress        _endpoint;
     protected ReliableSocketInputStream  _in;
     protected ReliableSocketOutputStream _out;
+
+    /*
+     * Every wall clock reading of this socket goes through _clock, so a test
+     * can install a clock it advances by hand and drive the retransmission
+     * schedule deterministically instead of sleeping on the real one.
+     */
+    private Clock _clock = Clock.SYSTEM;
 
     private byte[]  _recvbuffer = new byte[65535];
     private DatagramPacket _recvPacket;
@@ -2098,13 +2114,12 @@ public class ReliableSocket extends Socket
             });
 
     /*
-     * Round trip time estimation (RFC 6298). _srtt < 0 means "no sample
-     * taken yet", in which case the profile's retransmission timeout is used
-     * as the initial RTO. Guarded by the _unackedSentQueue monitor.
+     * Round trip time estimation and the retransmission timeout derived from
+     * it (RFC 6298). A fresh estimator has taken no sample yet and reports
+     * the profile's retransmission timeout.
+     * Guarded by the _unackedSentQueue monitor.
      */
-    private long _srtt = -1;
-    private long _rttvar = 0;
-    private int _rto;
+    private RtoEstimator _rto;
 
     private int _dupAcks = 0;
     private int _lastAckn = -1;
@@ -2180,14 +2195,10 @@ public class ReliableSocket extends Socket
 
     /*
      * A fast retransmission happens without any evidence of congestion, so
-     * its timeout is not backed off at all (MAX_RTO_BACKOFF_SHIFT instead).
+     * its timeout is not backed off at all (RtoEstimator.MAX_BACKOFF_SHIFT
+     * instead).
      */
     private static final int FAST_RETRANSMIT_BACKOFF_SHIFT = 0;
-
-    /* Bounds of the RTO computed from the round trip time estimators. */
-    private static final int MAX_RTO_BACKOFF_SHIFT = 4;
-    private static final long MIN_RTO = 50;
-    private static final long MAX_RTO = 5000;
 
     private static final int MAX_SEQUENCE_NUMBER        = 255;
 
@@ -2403,61 +2414,80 @@ public class ReliableSocket extends Socket
         }
     }
 
+    /**
+     * Runs one pass of the retransmission schedule: every unacknowledged
+     * segment whose own deadline has expired is retransmitted once with its
+     * timeout backed off, and the timer is re-armed for the next deadline.
+     * <p>
+     * The retransmission timer calls this when it fires. It is a method of its
+     * own so that a test can drive the schedule from a clock it advances by
+     * hand instead of waiting for real milliseconds to elapse, which is the
+     * only way to tell a correct backoff from a missing one: both keep
+     * retransmitting, only the instants differ.
+     * <p>
+     * Fails the connection, once the monitor has been released, if a segment
+     * has run out of retransmissions.
+     */
+    protected void runRetransmissionPass()
+    {
+        boolean limitExceeded = false;
+        long nowMillis = now();
+
+        synchronized (_unackedSentQueue) {
+            /*
+             * Only the segments whose own deadline has expired are
+             * retransmitted. Previously every unacknowledged segment was
+             * resent on each tick, which with a large window turns a
+             * single loss into a storm that congests the path even
+             * further.
+             */
+            while (true) {
+                Segment s = _retxQueue.peek();
+                if (s == null || s.deadline() > nowMillis) {
+                    break;
+                }
+
+                _retxQueue.poll();
+
+                if (s.isAcked()) {
+                    continue;
+                }
+
+                try {
+                    s.backOffRto(RtoEstimator.MAX_BACKOFF_SHIFT);
+                    limitExceeded = retransmitSegment(s);
+                }
+                catch (IOException xcp) {
+                    xcp.printStackTrace();
+                }
+
+                if (limitExceeded) {
+                    break;
+                }
+            }
+
+            if (_unackedSentQueue.isEmpty()) {
+                _retxQueue.clear();
+                _retransmissionTimer.cancel();
+            }
+            else {
+                rearmRetransmission();
+            }
+        }
+
+        // Only called after _unackedSentQueue has been released, so that the
+        // this -> _closeLock -> _unackedSentQueue lock order used by
+        // close()/connectionFailure() is never violated.
+        if (limitExceeded) {
+            connectionFailure();
+        }
+    }
+
     private class RetransmissionTimerTask implements Runnable
     {
         public void run()
         {
-            boolean limitExceeded = false;
-            long now = System.currentTimeMillis();
-
-            synchronized (_unackedSentQueue) {
-                /*
-                 * Only the segments whose own deadline has expired are
-                 * retransmitted. Previously every unacknowledged segment was
-                 * resent on each tick, which with a large window turns a
-                 * single loss into a storm that congests the path even
-                 * further.
-                 */
-                while (true) {
-                    Segment s = _retxQueue.peek();
-                    if (s == null || s.deadline() > now) {
-                        break;
-                    }
-
-                    _retxQueue.poll();
-
-                    if (s.isAcked()) {
-                        continue;
-                    }
-
-                    try {
-                        s.backOffRto(MAX_RTO_BACKOFF_SHIFT);
-                        limitExceeded = retransmitSegment(s);
-                    }
-                    catch (IOException xcp) {
-                        xcp.printStackTrace();
-                    }
-
-                    if (limitExceeded) {
-                        break;
-                    }
-                }
-
-                if (_unackedSentQueue.isEmpty()) {
-                    _retxQueue.clear();
-                    _retransmissionTimer.cancel();
-                }
-                else {
-                    rearmRetransmission();
-                }
-            }
-
-            // Only called after _unackedSentQueue has been released, so
-            // that the this -> _closeLock -> _unackedSentQueue lock order
-            // used by close()/connectionFailure() is never violated.
-            if (limitExceeded) {
-                connectionFailure();
-            }
+            runRetransmissionPass();
         }
     }
 
