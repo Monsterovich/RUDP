@@ -1600,11 +1600,23 @@ public class ReliableSocket extends Socket
                     }
 
                     Random rand = new Random(now());
+
+                    /*
+                     * The window the peer proposes is a field of its handshake
+                     * segment, so it is bounded() rather than taken as it
+                     * stands: the constructor's ceiling is a local policy, and
+                     * a peer proposing more than the sequence number space can
+                     * order is running against a wire format rather than
+                     * misbehaving, so the connection continues with as much of
+                     * the proposal as can be used. Validating it here instead
+                     * would throw on a well formed handshake and leave both
+                     * ends waiting on a connection neither will open.
+                     */
                     _profile = new ReliableSocketProfile(
                             _sendQueueSize,
                             _recvQueueSize,
                             segment.getMaxSegmentSize(),
-                            segment.getMaxOutstandingSegments(),
+                            ReliableSocketProfile.bounded(segment.getMaxOutstandingSegments()),
                             segment.getMaxRetransmissions(),
                             segment.getMaxCumulativeAcks(),
                             segment.getMaxOutOfSequence(),

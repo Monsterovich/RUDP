@@ -486,18 +486,29 @@ public class CongestionControlTest
     }
 
     /**
-     * A profile with a send queue above the ceiling and no limit on
-     * retransmissions.
+     * A profile with the largest queues the sequence number space can order
+     * and no limit on retransmissions.
      * <p>
-     * The queue is above the ceiling so that the window and not the queue is
-     * what holds the writer back - the socket checks the two in the same line,
-     * and a case about congestion control that was really about queue sizing
-     * would prove nothing about congestion control. The retransmissions are
-     * unlimited so that the schedule is only ever driven by this test.
+     * The queues are as deep as they may be so that the window and not the
+     * queue is what holds the writer back - the socket checks the two in the
+     * same line, and a case about congestion control that was really about
+     * queue sizing would prove nothing about congestion control. The
+     * retransmissions are unlimited so that the schedule is only ever driven
+     * by this test.
+     * <p>
+     * A ceiling above what the 8-bit sequence number space can order is
+     * clamped rather than rejected, because a ceiling is only ever read as
+     * min(maxOutstandingSegs, cwnd) and the congestion window never grows
+     * anywhere near the space: the cases below ask for one to stand in for
+     * "no ceiling at all", which the window being the smaller of the two
+     * still gives them for every value this test produces.
      */
     private static ReliableSocketProfile profile(int maxOutstanding)
     {
-        return new ReliableSocketProfile(255, 255, 1200, maxOutstanding, 0, 3, 3, 3,
+        int ceiling = Math.min(maxOutstanding, ReliableSocketProfile.MAX_WINDOW_SEGS);
+
+        return new ReliableSocketProfile(ReliableSocketProfile.MAX_WINDOW_SEGS,
+                ReliableSocketProfile.MAX_WINDOW_SEGS, 1200, ceiling, 0, 3, 3, 3,
                 60000, 200, 300);
     }
 

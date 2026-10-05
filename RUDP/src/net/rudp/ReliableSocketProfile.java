@@ -47,6 +47,33 @@ public class ReliableSocketProfile
     public final static int MAX_SEND_QUEUE_SIZE    = 96;
     public final static int MAX_RECV_QUEUE_SIZE    = 96;
 
+    /**
+     * The largest a window or a queue depth may be set to.
+     * <p>
+     * Segment numbers are 8 bits wide and are handed out modulo 255, and
+     * two of them are ordered by compareSequenceNumbers() rather than
+     * subtracted: a number is taken to be the later one only while it is
+     * less than half the space ahead, so 127 is as far ahead as any number
+     * can be recognised as being newer than another. A window that could
+     * hold more than that many segments is not merely large, it is
+     * unreadable - a segment arriving at the far end of it is compared
+     * against a number from the near end and comes out the older of the two,
+     * which is a segment dropped as a duplicate, a hole the sender never
+     * hears about closing, and numbers that keep being handed out until the
+     * space has turned over and the whole thing has repeated.
+     * <p>
+     * The ceiling is therefore on the number of segments in flight or
+     * buffered, not on the size of the number space, and it is 127 rather
+     * than 128: the comparison needs the distance to be strictly less than
+     * half the space, so a window of exactly 128 already puts a segment a
+     * number of positions too far ahead to be told apart from a duplicate.
+     * <p>
+     * A peer proposes its own maximum over the wire, so this is a bound on
+     * what may be configured and not a guarantee about what arrives - see
+     * ReliableSocketProfile.bounded().
+     */
+    public final static int MAX_WINDOW_SEGS        = 127;
+
     public final static int MAX_SEGMENT_SIZE       = 1200;
     public final static int MAX_OUTSTANDING_SEGS   = 64;
     public final static int MAX_RETRANS            = 3;
@@ -109,10 +136,10 @@ public class ReliableSocketProfile
                                  int retransmissionTimeout,
                                  int cumulativeAckTimeout)
     {
-        checkValue("maxSendQueueSize",      maxSendQueueSize,      1,   255);
-        checkValue("maxRecvQueueSize",      maxRecvQueueSize,      1,   255);
+        checkValue("maxSendQueueSize",      maxSendQueueSize,      1,   MAX_WINDOW_SEGS);
+        checkValue("maxRecvQueueSize",      maxRecvQueueSize,      1,   MAX_WINDOW_SEGS);
         checkValue("maxSegmentSize",        maxSegmentSize,        22,  65535);
-        checkValue("maxOutstandingSegs",    maxOutstandingSegs,    1,   255);
+        checkValue("maxOutstandingSegs",    maxOutstandingSegs,    1,   MAX_WINDOW_SEGS);
         checkValue("maxRetrans",            maxRetrans,            0,   255);
         checkValue("maxCumulativeAcks",     maxCumulativeAcks,     0,   255);
         checkValue("maxOutOfSequence",      maxOutOfSequence,      0,   255);
@@ -239,6 +266,42 @@ public class ReliableSocketProfile
         sb.append(_cumulativeAckTimeout);
         sb.append("]");
         return sb.toString();
+    }
+
+    /**
+     * Brings a window size that arrived from a peer into the range a
+     * sequence number can be ordered within, instead of rejecting it.
+     * <p>
+     * The bounds the constructor enforces are what a local caller is held
+     * to, but the maximum outstanding is also a field of the handshake
+     * segment and so is whatever the peer chose to put there. Rejecting an
+     * out of range proposal would leave the two ends of a connection that
+     * could otherwise agree disagreeing about the shape of the connection,
+     * over a number neither of them can use: the peer proposing a window
+     * of 200 is not attacking anything, it is running a version whose
+     * ceiling was higher, and the half-space is a property of the wire
+     * format rather than a local policy.
+     * <p>
+     * So the value is taken as far towards the usable range as it goes and
+     * the connection continues. A proposal below the range is raised to it,
+     * which is the only reading that leaves a window able to carry a
+     * segment.
+     *
+     * @param value the number of segments a peer proposed.
+     *
+     * @return the number of segments to use instead.
+     */
+    public static int bounded(int value)
+    {
+        if (value < 1) {
+            return 1;
+        }
+        else if (value > MAX_WINDOW_SEGS) {
+            return MAX_WINDOW_SEGS;
+        }
+        else {
+            return value;
+        }
     }
 
     private void checkValue(String param,
