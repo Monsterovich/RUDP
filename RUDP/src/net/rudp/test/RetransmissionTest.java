@@ -454,24 +454,21 @@ public class RetransmissionTest
                 assertQuiet(wire, 6);
 
                 /*
-                 * A segment sent after the hole, and named by no EAK, gives the
-                 * walk a reference: its timeout is the bare RTO, while the
-                 * hole's is that same RTO doubled, since the retransmission
-                 * the EAK caused counts as a timeout as far as the schedule is
-                 * concerned (RFC 6298 5.5).
+                 * Two segments of the five are still out: the head of the
+                 * hole, which the EAK retransmitted, and the one behind it,
+                 * which it did not.  Neither was named by the backoff, so the
+                 * second gives the walk its reference - its deadline is the
+                 * bare RTO, while the hole's is that same RTO doubled, since
+                 * the retransmission the EAK caused counts as a timeout as far
+                 * as the schedule is concerned (RFC 6298 5.5).
                  */
-                write(client, new byte[] { 6, 7, 8, 9, 10 });
-
-                Assert.equals("five originals, the hole head once, and this one",
-                        7, wire.dataCount());
-
-                long firstRetry = walkToNextDataSegment(client, wire, clock, at, 9);
+                long firstRetry = walkToNextDataSegment(client, wire, clock, at, 7);
                 long timeout = firstRetry - at;
 
-                Assert.equals("only the segment without a backoff timed out first, then the EAK head",
-                        2, wire.dataCount() - 7);
+                Assert.equals("the segment the EAK never touched timed out first",
+                        1, wire.dataCount() - 6);
 
-                long secondRetry = walkToNextDataSegment(client, wire, clock, firstRetry, 10);
+                long secondRetry = walkToNextDataSegment(client, wire, clock, firstRetry, 8);
 
                 /*
                  * Anchored at the send, not at the reference's retry: the hole's
@@ -484,7 +481,30 @@ public class RetransmissionTest
                 Assert.equals("the hole's retries doubled its timeout",
                         at + 2 * timeout, secondRetry);
                 Assert.equals("the hole head went out again",
-                        1, wire.dataCount() - 9);
+                        1, wire.dataCount() - 7);
+
+                /*
+                 * The EAK cut the window in half when it came in, and nothing
+                 * has been acknowledged since, so the flight is the same two
+                 * segments and the window has no room left in it.  Nothing may
+                 * go out until it does - a window that lets one segment past
+                 * anyway is not holding the sender back at all, which is how
+                 * the connection ended up writing at full speed over a path it
+                 * had just been told was congested.
+                 */
+                int quietAt = assertStalledWrite(client, wire);
+
+                /*
+                 * And an acknowledgment is what releases it: the window counts
+                 * segments in flight, so one arriving frees one slot and the
+                 * write that was waiting goes through - which is also what
+                 * tells the two cases apart. A sender held back until an
+                 * acknowledgment arrives is congestion control; one that stops
+                 * for any other reason is a stall.
+                 */
+                wire.passPlainAcksToo();
+                injector.sendAck(seqs[4]);
+                awaitDataSegments(wire, quietAt + 1);
             }
             finally {
                 closeQuietly(client);
@@ -587,6 +607,61 @@ public class RetransmissionTest
         Assert.equals("nothing else went out", expected, wire.dataCount());
     }
 
+    /**
+     * Requires that a write does not get onto the wire, and returns the count
+     * the wire was left at.
+     * <p>
+     * The write is made on a thread of its own and is expected to stay where
+     * it is: the sender is not allowed to put anything more on a path than
+     * the window it has been given, and the window here has no room left in
+     * it. Waiting for the thread to park rather than merely to start is what
+     * makes this an assertion rather than a grace period - a thread that had
+     * only been slow to be scheduled would leave the wire just as quiet, and
+     * would have gone on to send the segment a moment later.
+     * <p>
+     * The thread is left parked. It is a daemon and the socket's close wakes
+     * whatever is waiting on its window, so it cannot outlive the suite.
+     */
+    private static int assertStalledWrite(ReliableSocket client, Wire wire)
+    {
+        int before = wire.dataCount();
+
+        Thread writer = new Thread(() -> {
+            try {
+                client.getOutputStream().write(new byte[] { 6, 7, 8, 9, 10 });
+                client.getOutputStream().flush();
+            }
+            catch (IOException xcp) {
+                /* the socket was closed under it, which ends the test anyway */
+            }
+        }, "RetransmissionTest-StalledWrite");
+
+        writer.setDaemon(true);
+        writer.start();
+
+        long deadline = System.currentTimeMillis() + INJECTION_TIMEOUT_MS;
+
+        while (writer.getState() != Thread.State.WAITING &&
+               writer.getState() != Thread.State.TERMINATED) {
+            if (System.currentTimeMillis() >= deadline) {
+                throw new AssertionError("the write was still in progress after " +
+                        INJECTION_TIMEOUT_MS + "ms and had neither parked nor finished");
+            }
+
+            sleep(STEP_MS);
+        }
+
+        Assert.equals("the write is parked on a window with no room in it",
+                Thread.State.WAITING, writer.getState());
+
+        sleep(QUIET_GRACE_MS);
+
+        Assert.equals("nothing went out while the window was full",
+                before, wire.dataCount());
+
+        return before;
+    }
+
     private static void sleep(int millis)
     {
         try {
@@ -666,6 +741,17 @@ public class RetransmissionTest
         void passExtendedAcksOnly()
         {
             _onlyExtendedAcks = true;
+        }
+
+        /**
+         * Lets plain acknowledgments through as well, so that an injected one
+         * can be read by the client.  Anything the peer had outstanding has
+         * been acknowledged already by the time this is called, so the peer
+         * has nothing left to add to the wire.
+         */
+        void passPlainAcksToo()
+        {
+            _onlyExtendedAcks = false;
         }
 
         /**

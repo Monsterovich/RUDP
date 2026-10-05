@@ -39,8 +39,11 @@ javac -nowarn -d "$OUT" $(find RUDP/src -name '*.java')
 # run first because they are fast and localise a failure to a single method.
 # ConnectTest goes with them: it runs a real connection over loopback, but
 # without a peer that can be slow to answer, so it is fast and deterministic.
+# CongestionControlTest goes with those two: a real connection over loopback
+# whose peer is the test itself, and whose clock is frozen so that what the
+# window does is read from the wire rather than raced against a real timer.
 TESTS="SegmentParseTest RtoEstimatorTest RetransmissionTest ConnectTest \
-SimpleClientServerTest MultiplexedClientServerTest DataTransferTest"
+CongestionControlTest SimpleClientServerTest MultiplexedClientServerTest DataTransferTest"
 
 # Generous enough for the transfer tests, short enough to not be mistaken for a
 # run that is still working.

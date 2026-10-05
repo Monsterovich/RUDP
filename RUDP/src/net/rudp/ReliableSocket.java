@@ -265,10 +265,11 @@ public class ReliableSocket extends Socket
         _sendbuffer = new byte[_profile.maxSegmentSize()];
 
         /* Congestion control init */
-        _cwnd      = Math.min(INITIAL_CWND, _profile.maxOutstandingSegs());
+        _cwnd      = Math.min(INITIAL_CWND, congestionWindowCap());
         _ssthresh  = Long.MAX_VALUE;
         _congState = CONG_SLOW_START;
-        _congStartSeq = -1;
+        _cwndAcked = 0;
+        _recoveryPoint = -1;
 
         /* Register shutdown hook */
         try {
@@ -1103,9 +1104,18 @@ public class ReliableSocket extends Socket
         throws IOException
     {
         synchronized (_unackedSentQueue) {
+            /*
+             * The window is a count of segments that may be outstanding at
+             * once, so the test is the same one the queue size above is put
+             * to: send while there is room, wait while there is none.  A
+             * window of w therefore has w segments in flight and not w + 1,
+             * which is what a congestion window of one segment - the state a
+             * timeout leaves it in - has to mean if it is to hold anything
+             * back at all.
+             */
             long win = Math.min(_profile.maxOutstandingSegs(), _cwnd);
             while ((_unackedSentQueue.size() >= _sendQueueSize) ||
-                   (_counters.getOutstandingSegsCounter() > win)) {
+                   (_counters.getOutstandingSegsCounter() >= win)) {
                 if (!_connected) {
                     throw new SocketException("Socket is closed");
                 }
@@ -1181,6 +1191,135 @@ public class ReliableSocket extends Socket
     private static boolean eakMayRetransmit(Segment s, long nowMillis)
     {
         return !s.wasRetransmitted() || s.deadline() <= nowMillis;
+    }
+
+    /**
+     * Whether a received segment is an acknowledgment that says one thing and
+     * nothing else, which is what the three of them that signal a loss
+     * (RFC 5681 3.2) have to be.
+     * <p>
+     * Only a standalone acknowledgment qualifies. A data segment carries an
+     * acknowledgment of its own, so on a connection with traffic in both
+     * directions three of the peer's segments repeating one number - and
+     * acknowledging nothing new, since the peer's data is not about its own
+     * receive window - read as a loss that never happened and cut a window
+     * the path was carrying perfectly well. An extended acknowledgment is
+     * excluded for a different reason: it names the hole it is complaining
+     * about and has already driven its own recovery for it, so counting it
+     * towards a fast retransmit sends the head of the queue a second time,
+     * with none of the throttling that path is under, and cuts the window
+     * again on top of the cut the extended acknowledgment itself caused.
+     */
+    private static boolean isBareAck(Segment segment)
+    {
+        /*
+         * EAKSegment extends ACKSegment, so being one says nothing at all:
+         * every extended acknowledgment is an acknowledgment as far as
+         * instanceof is concerned. An extended one is not a bare
+         * acknowledgment - it is the receiver saying which segments it has
+         * beside the one it acknowledges - and counting a peer's reports of
+         * its holes towards a fast retransmit both retransmits a segment the
+         * peer never said was missing and cuts the window on top of the
+         * recovery the report has already driven.
+         */
+        return (segment instanceof ACKSegment) && !(segment instanceof EAKSegment);
+    }
+
+    /* ------------------------------------------------------------------
+     * Congestion control helpers.  Guarded by the _unackedSentQueue
+     * monitor, like the window they operate on.
+     * ------------------------------------------------------------------ */
+
+    /**
+     * The largest the congestion window may grow to.
+     * <p>
+     * The peer has already put a ceiling on what may be outstanding at once
+     * (maxOutstandingSegs, negotiated from the SYN), so a window above it
+     * buys nothing: min(maxOutstandingSegs, cwnd) is the same either way.  A
+     * slow start that is allowed to run on without a bound therefore ends up
+     * with a window of hundreds of segments whose only effect is on the
+     * arithmetic of the next loss, where ssthresh = cwnd / 2 and the halving
+     * is undone by the ceiling in a single step.
+     * <p>
+     * Never below MIN_CWND, so that a profile with a tiny segment limit still
+     * leaves the window large enough to be halved without reaching zero.
+     */
+    private long congestionWindowCap()
+    {
+        return Math.max(_profile.maxOutstandingSegs(), MIN_CWND);
+    }
+
+    /**
+     * The slow start threshold a loss just observed calls for: half of what
+     * was in flight, the number of segments that could be on the path at
+     * once (RFC 5681 3.2 step 1), never below MIN_CWND.
+     * <p>
+     * The flight is what bounds a sensible halving.  cwnd is not: it may sit
+     * far above the segments actually in flight when the loss is one of many
+     * in the window, and halving that leaves a threshold the window then
+     * walks straight back up to.
+     */
+    private long slowStartThresholdAfterLoss()
+    {
+        return Math.max(_counters.getOutstandingSegsCounter() / 2, MIN_CWND);
+    }
+
+    /**
+     * Starts a recovery episode, and reports whether this loss signal is the
+     * one that starts it.
+     * <p>
+     * A window is cut once per loss, not once per report of it.  Every
+     * segment of a window that was lost together times out in the same pass
+     * of the schedule, and the receiver sends an extended acknowledgment per
+     * few out-of-order arrivals, so a single loss arrives as a stream of
+     * signals: cutting on each one halves the threshold once per segment and
+     * drops it to MIN_CWND while the one flight is still in the air.  The
+     * same is true of fast retransmit, whose duplicate counter resets after
+     * each firing and so is free to send the head of the queue again within
+     * the same round trip.
+     * <p>
+     * The recovery point closes both: until an acknowledgment passes it, the
+     * flight it names is still being recovered from and a further signal
+     * says nothing new.  Sending something also ends it, since a segment
+     * numbered past the point belongs to a flight this episode cannot
+     * describe.
+     *
+     * @return true if the caller's loss signal is a new one and the window
+     *         may be cut.
+     */
+    private boolean beginRecovery()
+    {
+        int sndNxt = _counters.sndNxt();
+
+        if (_recoveryPoint < 0 || sndNxt < 0) {
+            _recoveryPoint = sndNxt;
+            _cwndAcked = 0;
+            return true;
+        }
+
+        if (compareSequenceNumbers(sndNxt, _recoveryPoint) <= 0) {
+            return false;
+        }
+
+        _recoveryPoint = sndNxt;
+        _cwndAcked = 0;
+        return true;
+    }
+
+    /**
+     * Ends the recovery episode in progress, if the acknowledgment shows the
+     * flight it names has been acknowledged.
+     * <p>
+     * An extended acknowledgment carries an acknowledgment number too and is
+     * handled here as well, so a peer that reports its holes with them gets
+     * its own window cut and then, once the hole is filled, this point as
+     * well - by the very segment the window was cut for.
+     */
+    private void endRecovery(int ackn)
+    {
+        if (_recoveryPoint >= 0 && compareSequenceNumbers(ackn, _recoveryPoint) >= 0) {
+            _recoveryPoint = -1;
+        }
     }
 
     /**
@@ -1601,12 +1740,14 @@ public class ReliableSocket extends Socket
             /* EAK-driven loss detected: reduce window.
              * EAK is receiver-signal of specific loss, not a timeout,
              * so we cut ssthresh and set cwnd to ssthresh (Reno fast
-             * recovery style) rather than resetting to 1. */
-            if (_eakLastRetxTime > 0) {
-                _ssthresh = Math.max(_cwnd / 2, 2L);
-                _cwnd = _ssthresh;
+             * recovery style) rather than resetting to 1.  One is enough:
+             * a window's worth of loss produces a stream of EAKs, and
+             * cutting on each of them halves the threshold once per
+             * report rather than once per loss. */
+            if (_eakLastRetxTime > 0 && beginRecovery()) {
+                _ssthresh = slowStartThresholdAfterLoss();
+                _cwnd = Math.min(_ssthresh, congestionWindowCap());
                 _congState = CONG_AVOIDANCE;
-                _congStartSeq = _counters.getLastInSequence();
             }
 
             if (_unackedSentQueue.isEmpty()) {
@@ -1859,6 +2000,7 @@ public class ReliableSocket extends Socket
         synchronized (_unackedSentQueue) {
             Segment newestAcked = null;
             int removed = 0;
+            int ackedData = 0;
 
             Iterator<Segment> it = _unackedSentQueue.iterator();
             while (it.hasNext()) {
@@ -1869,38 +2011,104 @@ public class ReliableSocket extends Socket
                     s.clearBackOff();
                     newestAcked = s;
                     removed++;
+
+                    if (s instanceof DATSegment) {
+                        ackedData++;
+                    }
                 }
             }
 
             _counters.decOutstandingSegsCounter(removed);
 
             /*
+             * A loss is recovered from once the acknowledgment has passed the
+             * point the episode was started at, so that the next one is a new
+             * loss and not this one arriving again by another route.
+             */
+            endRecovery(ackn);
+
+            /*
              * Congestion control: on an ACK that advances the ack point
              * (not a duplicate), grow the window according to the current
-             * phase.  Slow start doubles (cwnd += removed).  Congestion
-             * avoidance adds one segment per RTT (cwnd += 1 when the cum.
-             * ack number advances).
+             * phase.  Slow start doubles (cwnd += ackedData) up to the ceiling
+             * and stops at the threshold; congestion avoidance adds one
+             * segment per RTT, counted in acknowledged segments because a
+             * round trip's worth of them is cwnd of them.
+             *
+             * Only data segments count towards either.  The window exists to
+             * keep the amount of data in flight down, so an acknowledgment
+             * that carried no data says nothing about how much of the path is
+             * in use - and the two segments that are not data both have their
+             * acknowledgments arrive before the application has written
+             * anything at all, so counting them left every connection starting
+             * its first transfer with a window of INITIAL_CWND plus the number
+             * of them.
              */
-            if (removed > 0 && _congState == CONG_SLOW_START) {
-                _cwnd += removed;
+            long cap = congestionWindowCap();
+
+            if (ackedData > 0 && _congState == CONG_SLOW_START) {
+                _cwnd = Math.min(_cwnd + ackedData, cap);
+
+                /*
+                 * The threshold is what ends slow start (RFC 5681 3.1).  It is
+                 * never consulted anywhere else, so without this a slow start
+                 * runs for as long as the path never loses anything and the
+                 * window is held at the ceiling instead of turning over to
+                 * avoidance, which is the phase that probes for the bandwidth
+                 * a busy path actually has.
+                 */
+                if (_cwnd >= _ssthresh) {
+                    _congState = CONG_AVOIDANCE;
+                    _cwndAcked = 0;
+                }
             }
-            else if (removed > 0) {
+            else if (ackedData > 0 && _cwnd < cap) {
                 /* Congestion avoidance: one segment per RTT.
-                 * We detect a new RTT by the cumulative ACK advancing. */
-                if (_congStartSeq < 0 ||
-                    compareSequenceNumbers(ackn, _congStartSeq) > 0) {
-                    _cwnd += 1;
-                    _congStartSeq = ackn;
+                 *
+                 * An RTT is worth cwnd acknowledgments, so they are counted
+                 * rather than dated: the acknowledgment number is a sequence
+                 * number, and any comparison of it against a remembered one
+                 * says which of two numbers is larger, not how long ago
+                 * either was sent.  Each increment is then paid for out of the
+                 * count, so what is left over is carried into the next RTT and
+                 * a window that grew by one in the middle of a round trip
+                 * does not get that segment twice.
+                 */
+                _cwndAcked += ackedData;
+
+                while (_cwndAcked >= _cwnd) {
+                    _cwndAcked -= _cwnd;
+                    _cwnd++;
+                }
+
+                if (_cwnd > cap) {
+                    _cwnd = cap;
+                    _cwndAcked = 0;
                 }
             }
 
             /*
-             * An ACK that does not advance the acknowledgment point is a
-             * duplicate: three of them in a row mean the segment right after
-             * the acknowledged one was most likely lost, so retransmit it
-             * right away instead of waiting for its timeout to expire.
+             * An ACK that acknowledges nothing new, says the same as the one
+             * before it and carries no data of its own is a duplicate: three
+             * of them in a row mean the segment right after the acknowledged
+             * one was most likely lost, so retransmit it right away instead
+             * of waiting for its timeout to expire.
+             *
+             * All of that has to hold.  Testing only the number made any
+             * segment carrying an acknowledgment count, so a peer with data
+             * of its own to send cut this window down on its own traffic;
+             * isBareAck() rules that out, the number alone does not say the
+             * acknowledgment was a duplicate rather than the first one
+             * after an acknowledgment of something new, and there has to be
+             * something to retransmit for the signal to mean anything.
              */
-            if (!_dupAckValid || compareSequenceNumbers(ackn, _lastAckn) != 0) {
+            boolean duplicateAck = isBareAck(segment)
+                    && (removed == 0)
+                    && !_unackedSentQueue.isEmpty()
+                    && _dupAckValid
+                    && (compareSequenceNumbers(ackn, _lastAckn) == 0);
+
+            if (!duplicateAck) {
                 _lastAckn = ackn;
                 _dupAckValid = true;
                 _dupAcks = 0;
@@ -1914,15 +2122,22 @@ public class ReliableSocket extends Socket
                 updateRttSample(now() - newestAcked.sentTime());
             }
 
-            if (fastRetransmit && !_unackedSentQueue.isEmpty()) {
+            /*
+             * A loss seen by three duplicate ACKs is a loss of one segment,
+             * not of the window: halve it, drop to the threshold rather than
+             * to a single segment (RFC 5681 3.2 step 4), and send the one
+             * segment the duplicates point at - once.  The recovery point
+             * holds off a further round of duplicates from sending the head
+             * again before the peer has acknowledged past it.
+             */
+            if (fastRetransmit && !_unackedSentQueue.isEmpty() && beginRecovery()) {
                 Segment lost = _unackedSentQueue.get(0);
                 lost.backOffRto(FAST_RETRANSMIT_BACKOFF_SHIFT);
 
                 /* Fast retransmit -> loss detected: cut window */
-                _ssthresh = Math.max(_cwnd / 2, 2L);
-                _cwnd = 1;
+                _ssthresh = slowStartThresholdAfterLoss();
+                _cwnd = Math.min(_ssthresh, cap);
                 _congState = CONG_AVOIDANCE;
-                _congStartSeq = _counters.getLastInSequence();
 
                 try {
                     limitExceeded = retransmitSegment(lost);
@@ -2350,13 +2565,38 @@ public class ReliableSocket extends Socket
      * Guarded by the _unackedSentQueue monitor.
      * ------------------------------------------------------------------ */
     private static final long INITIAL_CWND        = 10; /* segments */
+    private static final long MIN_CWND            = 2;  /* segments */
     private static final long CONG_SLOW_START     = 1;
     private static final long CONG_AVOIDANCE      = 0;
 
     private long    _cwnd        = INITIAL_CWND; /* current congestion window (segments) */
     private long    _ssthresh    = Long.MAX_VALUE; /* slow-start threshold */
     private long    _congState   = CONG_SLOW_START;
-    private int     _congStartSeq = -1; /* seq number when slow start began */
+
+    /*
+     * Segments acknowledged since congestion avoidance last grew the window
+     * by one, counting the ones that have not been paid for yet.  An RTT is
+     * worth cwnd of them, so this is what "one segment per RTT" is counted
+     * in.  Kept in segments rather than in sequence numbers because an
+     * acknowledgment number and this window are the same space only by
+     * accident - the number handed out by _counters is the receive side's
+     * count, and reading it back as if it were the send side's put the two
+     * in step for no reason at all.
+     */
+    private long    _cwndAcked   = 0;
+
+    /*
+     * The highest sequence number handed out for sending (snd_nxt), and the
+     * recovery point of RFC 5681 3.2: while an acknowledgment has yet to pass
+     * _recoveryPoint, every further loss signal belongs to the flight already
+     * being recovered from, and neither the window nor the head of the queue
+     * is touched again on its account.  -1 means there is no such episode in
+     * progress.
+     *
+     * _sndNxt is maintained inside the send-side counters and read without
+     * the monitor, the way _lastInSequence is.
+     */
+    private int     _recoveryPoint = -1;
 
     private Object _recvQueueLock = new Object();  /* Lock for receiver queues */
     private Counters _counters    = new Counters(); /* Sequence number, ack counters, etc. */
@@ -2467,13 +2707,27 @@ public class ReliableSocket extends Socket
 
         public synchronized int nextSequenceNumber()
         {
-            return (_seqn = ReliableSocket.nextSequenceNumber(_seqn));
+            _sndNxt = (_seqn = ReliableSocket.nextSequenceNumber(_seqn));
+            return _seqn;
         }
 
         public synchronized int setSequenceNumber(int n)
         {
             _seqn = n;
+            _sndNxt = n;
             return _seqn;
+        }
+
+        /**
+         * The highest sequence number handed out for sending so far, or -1
+         * while nothing has been sent.  The recovery point is measured against
+         * it, so a segment counts as sent as soon as it has been numbered: a
+         * number that was handed out and then lost on the way to the wire is
+         * still a segment that the peer may never see.
+         */
+        public int sndNxt()
+        {
+            return _sndNxt;
         }
 
         /*
@@ -2552,6 +2806,7 @@ public class ReliableSocket extends Socket
         }
 
         private int _seqn;             /* Segment sequence number */
+        private volatile int _sndNxt = -1;     /* Highest segment sequence number sent */
         private volatile int _lastInSequence;   /* Last in-sequence received segment */
 
         /*
@@ -2701,11 +2956,21 @@ public class ReliableSocket extends Socket
                     limitExceeded = retransmitSegment(s);
 
                     /* Timeout-driven retransmit = lost segment, signal of
-                     * congestion.  Cut window aggressively (Reno timeout). */
-                    _ssthresh = Math.max(_cwnd / 2, 2L);
-                    _cwnd = 1;
-                    _congState = CONG_SLOW_START;
-                    _congStartSeq = -1;
+                     * congestion.  Cut window aggressively (Reno timeout).
+                     *
+                     * Once per loss, not once per expired segment: a window
+                     * that went down together has one deadline shared by all
+                     * of it, so they all come due in this pass and each cut
+                     * halved the threshold again, leaving it at the floor
+                     * after three segments however large the window had been.
+                     * The recovery point is what says the rest of them are
+                     * the same loss being reported again. */
+                    if (beginRecovery()) {
+                        _ssthresh = slowStartThresholdAfterLoss();
+                        _cwnd = 1;
+                        _congState = CONG_SLOW_START;
+                        _cwndAcked = 0;
+                    }
                 }
                 catch (IOException xcp) {
                     xcp.printStackTrace();
