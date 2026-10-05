@@ -111,6 +111,7 @@ public class RetransmissionTest
         Assert.suite("retransmission schedule");
 
         testBackoffSchedule();
+        testTimeoutAnswer();
         testEakDrivenRecovery();
 
         System.exit(Assert.report());
@@ -275,6 +276,186 @@ public class RetransmissionTest
                 }
 
                 Assert.equals("nothing was retransmitted", 3, wire.dataCount());
+            }
+            finally {
+                closeQuietly(client);
+                peer.shutdown();
+                server.close();
+                injector.close();
+                wire.close();
+            }
+        });
+    }
+
+    /**
+     * What a timeout is answered with: one segment, and the backoff that goes
+     * with it.
+     * <p>
+     * Two separate things are under test, and they were one bug each. A window
+     * that times out used to be retransmitted whole, which is a burst sent on
+     * the one occasion the path has just said it cannot carry what it was
+     * already carrying. And the doubling the timeout causes was kept on the
+     * segment that happened to time out, so everything sent afterwards started
+     * again at the bare timeout - a path that is slow rather than down then gets
+     * a second copy of every new segment inside a single round trip, which is the
+     * congestion the timeout is an answer to.
+     */
+    private static void testTimeoutAnswer()
+    {
+        Assert.test("a window that timed out together is retried a segment at a time", () -> {
+            ManualClock clock = new ManualClock(1000000L);
+            Wire wire = new Wire();
+            Peer peer = new Peer();
+            Injector injector = new Injector();
+
+            ReliableServerSocket server = peer.start();
+            TestClientSocket client = new TestClientSocket(wire, profile(0), clock);
+
+            try {
+                client.connect(new InetSocketAddress("127.0.0.1", server.getLocalPort()),
+                        CONNECT_TIMEOUT_MS);
+                peer.awaitConnection();
+                settleNullSegment(client, wire, injector);
+                client.stopTimers();
+                wire.cutOff();
+
+                /*
+                 * Three segments written against a clock that is not running,
+                 * so they share one send instant and one deadline - a window
+                 * that went down together, which is what a burst of loss looks
+                 * like from here.
+                 */
+                for (int i = 0; i < 3; i++) {
+                    write(client, new byte[] { 1, 2, 3, 4, 5 });
+                }
+
+                Assert.equals("three segments went out", 3, wire.dataCount());
+
+                long sentAt = clock.currentTimeMillis();
+                long firstRetry = walkToNextDataSegment(client, wire, clock, sentAt, 4);
+                long timeout = firstRetry - sentAt;
+
+                Assert.isTrue("the first retry waited for a timeout (" + timeout + "ms)",
+                        timeout > 0);
+
+                /*
+                 * One segment. The whole window came due together, and Reno
+                 * answers a timeout with the oldest unacknowledged segment
+                 * alone (RFC 5681 3.1): the rest of the flight is recovered by
+                 * the acknowledgment its retransmission brings, or named by the
+                 * peer's report of the gap. This used to send all three, so a
+                 * window that had just been shown not to fit the path was handed
+                 * another window's worth all at once.
+                 */
+                Assert.equals("only the head of the window was retransmitted",
+                        4, wire.dataCount());
+
+                /*
+                 * And the two behind it were held rather than dropped: each is
+                 * still owed its own deadline, which this next retry is. It
+                 * comes at the doubled timeout, because neither of these two
+                 * segments has timed out and a timeout backs the connection off
+                 * (RFC 6298 5.5) - which is also what stops the second segment
+                 * from going out at the bare timeout its predecessor used, one
+                 * round trip after the path had already given notice.
+                 */
+                long secondRetry = walkToNextDataSegment(client, wire, clock, firstRetry, 5);
+
+                Assert.equals("and still one segment per pass", 5, wire.dataCount());
+                Assert.equals("the next one waited the backed off timeout",
+                        firstRetry + 2 * timeout, secondRetry);
+            }
+            finally {
+                closeQuietly(client);
+                peer.shutdown();
+                server.close();
+                injector.close();
+                wire.close();
+            }
+        });
+
+        Assert.test("data sent after a timeout waits the backed off timeout", () -> {
+            ManualClock clock = new ManualClock(1000000L);
+            Wire wire = new Wire();
+            Peer peer = new Peer();
+            Injector injector = new Injector();
+
+            ReliableServerSocket server = peer.start();
+            TestClientSocket client = new TestClientSocket(wire, profile(0), clock);
+
+            try {
+                client.connect(new InetSocketAddress("127.0.0.1", server.getLocalPort()),
+                        CONNECT_TIMEOUT_MS);
+                peer.awaitConnection();
+                settleNullSegment(client, wire, injector);
+                client.stopTimers();
+
+                /*
+                 * The peer is silenced by source rather than by segment type,
+                 * because this case has to inject an acknowledgment of its own
+                 * while leaving the peer's off the wire.
+                 */
+                wire.passOnlyFrom(injector.getLocalPort());
+
+                write(client, new byte[] { 1, 2, 3, 4, 5 });
+
+                Assert.equals("one segment went out", 1, wire.dataCount());
+
+                long sentAt = clock.currentTimeMillis();
+                long firstRetry = walkToNextDataSegment(client, wire, clock, sentAt, 2);
+                long timeout = firstRetry - sentAt;
+
+                Assert.isTrue("the retry waited for a timeout (" + timeout + "ms)",
+                        timeout > 0);
+
+                /*
+                 * Take the retransmitted segment off the schedule, which is what
+                 * lets the writer put anything new out at all: a timeout leaves
+                 * the window at one segment, so with one still in flight the
+                 * write below would sit waiting for room that only an
+                 * acknowledgment can free - which makes the write the proof that
+                 * the injected segment was dealt with and not merely read.
+                 *
+                 * This acknowledgment carries no round trip sample even though it
+                 * advances the acknowledgment point, because the segment it takes
+                 * off has been retransmitted and Karn's algorithm says a
+                 * retransmitted segment cannot time one (RFC 6298 5.7). So the
+                 * backoff is still in force for whatever is sent next, which is
+                 * the state this case is about.
+                 */
+                int retriedSeq = wire.dataSeqs()[wire.dataCount() - 1];
+                int before = wire.receivedCount();
+
+                injector.sendAck(retriedSeq);
+                wire.awaitReceived(before + 1);
+
+                long sentAfterTimeout = clock.currentTimeMillis();
+
+                /*
+                 * Two on the wire already: the segment and the copy of it the
+                 * timeout put out. What is being counted from here is the new
+                 * data and the one retransmission of it that is under test.
+                 */
+                int beforeWrite = wire.dataCount();
+
+                write(client, new byte[] { 6, 7, 8, 9, 10 });
+
+                Assert.equals("the new segment went out", beforeWrite + 1,
+                        wire.dataCount());
+
+                /*
+                 * It has never timed out - it was not even written when the
+                 * timeout happened - and it must still be given the doubled
+                 * timeout. A backoff kept on the timed out segment alone leaves
+                 * everything sent afterwards on the unbacked off one, so a path
+                 * that is slow rather than down is told to hurry up by the very
+                 * timeout meant to tell it to wait.
+                 */
+                long newRetry = walkToNextDataSegment(client, wire, clock,
+                        sentAfterTimeout, beforeWrite + 2);
+
+                Assert.equals("the new segment waited the backed off timeout",
+                        sentAfterTimeout + 2 * timeout, newRetry);
             }
             finally {
                 closeQuietly(client);
@@ -744,6 +925,22 @@ public class RetransmissionTest
         }
 
         /**
+         * Delivers only what arrives from the given port and swallows the rest.
+         * <p>
+         * By source rather than by segment type, which is what lets a case have
+         * a plain acknowledgment injected while the peer stays deaf to
+         * everything: a filter on the type would drop the injected acknowledgment
+         * along with the peer's own, and cutOff() would drop both. A peer that
+         * can acknowledge anything would resolve the very holes a case is trying
+         * to leave open, so it has to be silenced by source rather than have its
+         * acknowledgments recognized and ignored.
+         */
+        void passOnlyFrom(int port)
+        {
+            _acceptedPort = port;
+        }
+
+        /**
          * Lets plain acknowledgments through as well, so that an injected one
          * can be read by the client.  Anything the peer had outstanding has
          * been acknowledged already by the time this is called, so the peer
@@ -918,6 +1115,16 @@ public class RetransmissionTest
                     continue;
                 }
 
+                if (_acceptedPort != 0 && p.getPort() != _acceptedPort) {
+                    /*
+                     * From somewhere other than the injector: the peer, whose
+                     * acknowledgments are what this case is keeping off the
+                     * wire. Swallowed here rather than left to be dealt with,
+                     * so it cannot take a segment off the schedule.
+                     */
+                    continue;
+                }
+
                 if (_onlyExtendedAcks && !isExtendedAck(p)) {
                     continue;
                 }
@@ -954,6 +1161,7 @@ public class RetransmissionTest
 
         private volatile boolean _cutOff;
         private volatile boolean _onlyExtendedAcks;
+        private volatile int _acceptedPort;
         private int _received;
         private final List<byte[]> _sent = new ArrayList<byte[]>();
     }

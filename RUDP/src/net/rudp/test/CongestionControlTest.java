@@ -181,8 +181,24 @@ public class CongestionControlTest
                 link.advanceToTimeout();
                 link.runSchedule();
 
-                Assert.equals("the whole window came due at once",
-                        inFlight, link.wire().dataCount() - inFlight);
+                /*
+                 * The whole window came due, and the head is all that goes back
+                 * out (RFC 5681 3.1). The pass used to send the lot, so a window
+                 * that had just been shown not to fit the path was handed another
+                 * window's worth all at once - the worst moment available to
+                 * double the load on it.
+                 */
+                Assert.equals("only the oldest unacknowledged segment was retransmitted",
+                        1, link.wire().dataCount() - inFlight);
+
+                /*
+                 * The rest were not dropped, only held: they keep their place in
+                 * the queue and a deadline of their own, so an acknowledgment
+                 * that recovers the window in one go still takes every one of
+                 * them off the schedule. A receiver that got the head back has
+                 * the whole window, and says so with the highest number it holds.
+                 */
+                link.acknowledgeEverything();
 
                 /*
                  * The threshold is half the flight - five segments, not the two

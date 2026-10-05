@@ -1418,6 +1418,58 @@ public class ReliableSocket extends Socket
     }
 
     /**
+     * Pushes every other segment whose deadline has expired out to a deadline
+     * of its own, at the timeout currently in force for it.
+     * <p>
+     * Used after a timeout pass has retransmitted the head of the window: the
+     * rest of the flight came due with it, and RFC 5681 3.1 answers a timeout
+     * with the oldest unacknowledged segment alone. Leaving their deadlines
+     * expired would not hold them back, though - the very next thing this pass
+     * does is re-arm the timer for the earliest pending deadline, which is
+     * then already in the past, so the whole window would come due again one
+     * millisecond later and the burst would simply be deferred rather than
+     * avoided.
+     * <p>
+     * Nothing is dropped: the queue is the record of what is outstanding, so
+     * each of these keeps its place in it and keeps a deadline, which means a
+     * segment that really is lost is still retried on its own timer.
+     * <p>
+     * Must be called while holding the _unackedSentQueue monitor.
+     */
+    private void postponeRetransmissions(long nowMillis)
+    {
+        ArrayList<Segment> pending = new ArrayList<Segment>(_retxQueue);
+        boolean postponed = false;
+
+        for (Segment s : pending) {
+            if (s.isAcked() || s.deadline() > nowMillis) {
+                continue;
+            }
+
+            s.postpone(nowMillis, rtoFor(s));
+            postponed = true;
+        }
+
+        if (!postponed) {
+            return;
+        }
+
+        /*
+         * The schedule is a heap ordered by deadline, and every entry that
+         * mattered here has just had its deadline moved, so it is rebuilt in
+         * one pass. Repairing it entry by entry would leave it in the wrong
+         * order - and would be quadratic, since moving one entry out of a heap
+         * is itself a walk of it.
+         */
+        _retxQueue.clear();
+        for (Segment s : pending) {
+            if (s.deadline() != Long.MAX_VALUE) {
+                _retxQueue.add(s);
+            }
+        }
+    }
+
+    /**
      * Folds a round trip time sample into the retransmission timeout
      * estimator (RFC 6298). Must be called while holding the
      * _unackedSentQueue monitor.
@@ -2959,15 +3011,27 @@ public class ReliableSocket extends Socket
     protected void runRetransmissionPass()
     {
         boolean limitExceeded = false;
+        boolean timeoutExpired = false;
         long nowMillis = now();
 
         synchronized (_unackedSentQueue) {
             /*
-             * Only the segments whose own deadline has expired are
-             * retransmitted. Previously every unacknowledged segment was
-             * resent on each tick, which with a large window turns a
-             * single loss into a storm that congests the path even
-             * further.
+             * A pass over a window that timed out together used to go round all
+             * of it, so a window of sixty-four came due in one pass and sixty
+             * four packets went out at once - on the one occasion the path has
+             * just said it could not carry what it was already carrying. Reno
+             * answers a timeout with the oldest unacknowledged segment alone
+             * (RFC 5681 3.1): the rest of the flight is left to be recovered
+             * by the acknowledgment that its retransmission brings, or by the
+             * peer's own report of what is missing, and the window that is
+             * rebuilt is then as small as the path has just proved it can
+             * take.
+             *
+             * So this pass retransmits the head and nothing else, and the
+             * segments behind it are pushed out to a deadline of their own
+             * rather than left expired. Left expired they would be due again
+             * the instant this pass re-armed the timer for them, which is the
+             * same burst one scheduling step later.
              */
             while (true) {
                 Segment s = _retxQueue.peek();
@@ -2982,25 +3046,15 @@ public class ReliableSocket extends Socket
                 }
 
                 try {
-                    s.backOffRto(RtoEstimator.MAX_BACKOFF_SHIFT);
+                    /* RFC 6298 5.5: a timeout backs the RTO off for the
+                     * connection, so that everything sent from here on
+                     * inherits it and not just this segment. Backing the
+                     * segment off as well would count this one timeout
+                     * twice, and the two shifts are added together when the
+                     * next deadline is stamped. */
+                    _rto.backOff();
                     limitExceeded = retransmitSegment(s);
-
-                    /* Timeout-driven retransmit = lost segment, signal of
-                     * congestion.  Cut window aggressively (Reno timeout).
-                     *
-                     * Once per loss, not once per expired segment: a window
-                     * that went down together has one deadline shared by all
-                     * of it, so they all come due in this pass and each cut
-                     * halved the threshold again, leaving it at the floor
-                     * after three segments however large the window had been.
-                     * The recovery point is what says the rest of them are
-                     * the same loss being reported again. */
-                    if (beginRecovery()) {
-                        _ssthresh = slowStartThresholdAfterLoss();
-                        _cwnd = 1;
-                        _congState = CONG_SLOW_START;
-                        _cwndAcked = 0;
-                    }
+                    timeoutExpired = true;
                 }
                 catch (IOException xcp) {
                     xcp.printStackTrace();
@@ -3008,6 +3062,51 @@ public class ReliableSocket extends Socket
 
                 if (limitExceeded) {
                     break;
+                }
+
+                /*
+                 * The rest of the window that came due with this one waits.
+                 * The timeout was a statement about the path, and the segments
+                 * behind the head are not evidence of anything more: the
+                 * acknowledgment the head's retransmission brings normally
+                 * takes them off the queue in one go, and the ones that really
+                 * are lost are named by the peer's report of its gap. Sending
+                 * them here would put a window's worth of packets back onto a
+                 * path that has just timed out carrying a window's worth, which
+                 * is the congestion the timeout is an answer to (RFC 5681 3.1).
+                 *
+                 * Their deadlines are pushed out rather than left expired: an
+                 * expired one would be due again the moment this pass re-armed
+                 * the timer, which is the same burst one scheduling step later.
+                 */
+                postponeRetransmissions(nowMillis);
+                break;
+            }
+
+            /*
+             * A pass that found nothing due leaves the schedule alone. The
+             * window is only cut when something actually timed out, so a pass
+             * that merely finds acknowledged segments still on the schedule -
+             * which happens whenever an acknowledgment and a deadline cross -
+             * cannot cut a window for a loss that has already been accounted
+             * for.
+             */
+            if (timeoutExpired) {
+                /* Timeout-driven retransmit = lost segment, signal of
+                 * congestion.  Cut window aggressively (Reno timeout).
+                 *
+                 * Once per loss, not once per expired segment: a window
+                 * that went down together has one deadline shared by all
+                 * of it, so they all come due in this pass and each cut
+                 * halved the threshold again, leaving it at the floor
+                 * after three segments however large the window had been.
+                 * The recovery point is what says the rest of them are
+                 * the same loss being reported again. */
+                if (beginRecovery()) {
+                    _ssthresh = slowStartThresholdAfterLoss();
+                    _cwnd = 1;
+                    _congState = CONG_SLOW_START;
+                    _cwndAcked = 0;
                 }
             }
 

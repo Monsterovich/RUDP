@@ -141,6 +141,25 @@ public abstract class Segment
     }
 
     /**
+     * Moves this segment's timeout out to 'rtoMillis' from now, without
+     * recording a transmission.
+     * <p>
+     * The deadline and the send time are deliberately not moved together. The
+     * send time is what a round trip sample is measured from, so touching it
+     * here would silently rewrite the age of a segment that has not been sent
+     * again; and the segment is not flagged as retransmitted, so an
+     * acknowledgment that arrives before its new deadline can still be used
+     * to sample the path.
+     *
+     * @param nowMillis the current time.
+     * @param rtoMillis the timeout to wait from now.
+     */
+    public void postpone(long nowMillis, int rtoMillis)
+    {
+        _deadline = nowMillis + rtoMillis;
+    }
+
+    /**
      * Records one more timeout on this segment, doubling its retransmission
      * backoff up to 'shift' doublings. The multiplier itself is applied by the
      * caller when it stamps the next deadline (see ReliableSocket.rtoFor), so
