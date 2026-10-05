@@ -55,6 +55,7 @@ public class RtoEstimatorTest
         testSampling();
         testSamplingBounds();
         testBackoff();
+        testConnectionBackoff();
         testSegmentSchedule();
         testRejectsNonsense();
 
@@ -173,6 +174,90 @@ public class RtoEstimatorTest
             // The socket caps the shift at MAX_BACKOFF_SHIFT; beyond that the
             // doubling is the caller's business, not the estimator's.
             Assert.equals("cap", 4, RtoEstimator.MAX_BACKOFF_SHIFT);
+        });
+    }
+
+    private static void testConnectionBackoff()
+    {
+        Assert.test("a timeout backs the connection off, not just the segment that "
+                + "timed out (RFC 6298 5.5)", () -> {
+            /* A brand new segment, with no history of its own. It is the one the
+               backoff this connection is carrying is for: it is going onto the
+               path that just failed to acknowledge anything, and a timeout said
+               something about the path rather than about the segment the timer
+               happened to reach first. Stamping it with the unbacked off timeout
+               is what has a connection that is merely slow retrying several
+               times inside one round trip, which is the congestion the timeout
+               is an answer to. */
+            RtoEstimator rto = new RtoEstimator(200);
+            Segment fresh = new DATSegment(1, 2, new byte[] { 1 }, 0, 1);
+
+            Assert.equals("nothing has timed out yet", 200, rto.rtoFor(fresh.rtoShift()));
+
+            rto.backOff();
+
+            Assert.equals("backoff doublings", 1, rto.backoffShift());
+            Assert.equals("a segment sent after the timeout", 400,
+                    rto.rtoFor(fresh.rtoShift()));
+
+            rto.backOff();
+
+            Assert.equals("a second timeout", 800, rto.rtoFor(fresh.rtoShift()));
+        });
+
+        Assert.test("a new sample ends the backoff (RFC 6298 5.3)", () -> {
+            /* The backoff stood for the stretch in which there was no
+               measurement to trust. A sample is the evidence that the path is
+               worth measuring again, so carrying the doubling forward would keep
+               paying for a measurement that has since been replaced - and on a
+               connection whose RTO is already at the ceiling it would never be
+               paid back at all. */
+            RtoEstimator rto = new RtoEstimator(200);
+            Segment fresh = new DATSegment(1, 2, new byte[] { 1 }, 0, 1);
+
+            rto.backOff();
+            rto.backOff();
+            rto.backOff();
+
+            Assert.equals("backed off", 1600, rto.rtoFor(fresh.rtoShift()));
+
+            rto.updateSample(100);
+
+            Assert.equals("backoff doublings after the sample", 0, rto.backoffShift());
+            Assert.equals("srtt", 100, rto.srtt());
+            Assert.equals("rto", 300, rto.rto());
+            Assert.equals("the next segment sent", 300, rto.rtoFor(fresh.rtoShift()));
+        });
+
+        Assert.test("the connection's and a segment's doublings add up", () -> {
+            /* They count different things: the connection's says the path has
+               not acknowledged anything recently, the segment's says this one
+               segment has been sent more than once. Both are real and a segment
+               that has been through both is owed the sum. */
+            RtoEstimator rto = new RtoEstimator(200);
+            Segment segment = new DATSegment(1, 2, new byte[] { 1 }, 0, 1);
+
+            segment.backOffRto(RtoEstimator.MAX_BACKOFF_SHIFT);
+            rto.backOff();
+
+            Assert.equals("one of each", 800, rto.rtoFor(segment.rtoShift()));
+
+            segment.backOffRto(RtoEstimator.MAX_BACKOFF_SHIFT);
+            rto.backOff();
+
+            Assert.equals("two of each", 3200, rto.rtoFor(segment.rtoShift()));
+        });
+
+        Assert.test("the connection's backoff stops doubling at the cap", () -> {
+            RtoEstimator rto = new RtoEstimator(1000);
+
+            for (int timeout = 0; timeout < RtoEstimator.MAX_BACKOFF_SHIFT + 3; timeout++) {
+                rto.backOff();
+            }
+
+            Assert.equals("backoff doublings", RtoEstimator.MAX_BACKOFF_SHIFT,
+                    rto.backoffShift());
+            Assert.equals("timeout", RtoEstimator.MAX_RTO, rto.rto());
         });
     }
 

@@ -82,6 +82,16 @@ public final class RtoEstimator
             rttMillis = 1;
         }
 
+        /*
+         * A fresh sample supersedes the backoff (RFC 6298 5.3). The backed off
+         * value stood for the period in which there was no measurement to
+         * trust - the path was either down or not acknowledging what went out -
+         * and a sample is the evidence that it is worth trusting again, so
+         * carrying the doubling forward would keep paying for a measurement
+         * that has since been replaced.
+         */
+        _backoffShift = 0;
+
         if (_srtt < 0) {
             _srtt = rttMillis;
             _rttvar = rttMillis / 2;
@@ -104,29 +114,71 @@ public final class RtoEstimator
     }
 
     /**
-     * Returns the current RTO, without any backoff applied.
+     * Returns the current RTO, with any connection-level backoff applied.
      *
      * @return the retransmission timeout in milliseconds.
      */
     public int rto()
     {
-        return _rto;
+        return rtoFor(0);
+    }
+
+    /**
+     * Records one timeout on the connection, backing the RTO off for as long
+     * as no sample replaces it (RFC 6298 5.5).
+     * <p>
+     * The backoff belongs to the connection rather than to the segment that
+     * happened to time out first. A timeout says the path stopped
+     * acknowledging, and every segment sent after it is on that same path:
+     * stamping new segments with the unbacked-off timeout is what makes a
+     * connection that is merely slow retry several times inside one RTT,
+     * which is the congestion a timeout is supposed to answer. Only a new
+     * sample ends it (RFC 6298 5.3), so a path that stays down keeps the
+     * doubling on everything sent into it, not just on the one segment the
+     * timer happened to reach.
+     *
+     * @see #updateSample(long)
+     */
+    public void backOff()
+    {
+        if (_backoffShift < MAX_BACKOFF_SHIFT) {
+            _backoffShift++;
+        }
+    }
+
+    /**
+     * Returns the number of connection-level backoff doublings in force,
+     * which is zero until something has timed out and zero again once a
+     * sample has replaced the estimate.
+     *
+     * @return the connection's backoff doublings.
+     */
+    public int backoffShift()
+    {
+        return _backoffShift;
     }
 
     /**
      * Returns the timeout to stamp on a segment that has accumulated the
-     * given number of exponential backoff doublings.
+     * given number of exponential backoff doublings of its own.
+     * <p>
+     * The segment's own doublings are added to the connection's. The two
+     * count different things: the connection's says the path has not
+     * acknowledged anything recently, while the segment's says this
+     * particular segment has been sent more than once, which is a per
+     * segment count the connection cannot keep (RFC 6298 5.6 restarts the
+     * timer from the oldest outstanding segment, not from every one).
      *
-     * @param backoffShift the segment's backoff doublings.
+     * @param segmentShift the segment's backoff doublings.
      * @return the effective timeout in milliseconds.
      */
-    public int rtoFor(int backoffShift)
+    public int rtoFor(int segmentShift)
     {
-        if (backoffShift < 0) {
+        if (segmentShift < 0) {
             throw new IllegalArgumentException("backoffShift must not be negative");
         }
 
-        long rto = ((long) _rto) << backoffShift;
+        long rto = ((long) _rto) << (_backoffShift + segmentShift);
         return (int) (rto > MAX_RTO ? MAX_RTO : rto);
     }
 
@@ -165,4 +217,9 @@ public final class RtoEstimator
     private long _srtt = -1;
     private long _rttvar = 0;
     private int _rto;
+
+    /* Connection-level backoff doublings, held here rather than on each
+       segment so that a segment sent after a timeout inherits it. Cleared by
+       the next sample (see updateSample). */
+    private int _backoffShift = 0;
 }
