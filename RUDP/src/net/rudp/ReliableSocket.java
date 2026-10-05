@@ -1057,7 +1057,6 @@ public class ReliableSocket extends Socket
             log("sent " + s);
         }
 
-        s.markSent(now(), rtoFor(s));
         sendSegmentImpl(s);
     }
 
@@ -1131,15 +1130,11 @@ public class ReliableSocket extends Socket
             _unackedSentQueue.add(segment);
 
             /*
-             * Stamp the deadline here, before arming, and not leave it to
-             * sendSegment() below: armRetransmission() skips segments whose
-             * deadline is still Long.MAX_VALUE, so arming an unstamped
-             * segment silently dropped it from the retransmission schedule
-             * and its first transmission was never retried. That is why a
-             * lost SYN used to hang in SYN_SENT until connect()'s own
-             * timeout instead of being retransmitted.
+             * Arm with Long.MAX_VALUE so the segment is scheduled (but not
+             * due yet).  sendSegment() below stamps the real deadline and
+             * armRetransmission() is called again from retransmitSegment()
+             * after backoff, so the deadline is always correct.
              */
-            segment.markSent(now(), rtoFor(segment));
             armRetransmission(segment);
         }
 
@@ -1376,7 +1371,20 @@ public class ReliableSocket extends Socket
     private void armRetransmission(Segment segment)
     {
         _retxQueue.remove(segment);
-        if (segment.deadline() != Long.MAX_VALUE) {
+        /*
+         * Compute the deadline from the segment's current backoff state
+         * rather than trusting a stored value: backOffRto() may have
+         * changed the shift after markSent last ran, so the stored
+         * deadline could be stale.  Using _rto.rtoFor(segment.rtoShift())
+         * always gives the correct deadline for whatever backoff is in
+         * force right now.
+         */
+        int effectiveRto = _rto.rtoFor(segment.rtoShift());
+        long effectiveDeadline = now() + effectiveRto;
+        boolean needsReschedule = segment.deadline() == Long.MAX_VALUE
+                || effectiveDeadline != segment.deadline();
+        if (needsReschedule) {
+            segment.markSent(now(), effectiveRto);
             _retxQueue.add(segment);
         }
 
@@ -1732,21 +1740,33 @@ public class ReliableSocket extends Socket
 
         synchronized (_unackedSentQueue) {
 
-            /* Removed acknowledged segments from sent queue */
+            /*
+             * Cumulative prefix (seq <= lastInSequence) is cleared in one call.
+             * Scattered EAK acks after the prefix are removed in reverse-index
+             * order so array shifts hit only the tail.
+             */
             int removed = 0;
-            for (it = _unackedSentQueue.iterator(); it.hasNext(); ) {
-                Segment s = (Segment) it.next();
-                if ((compareSequenceNumbers(s.seq(), lastInSequence) <= 0)) {
-                    it.remove();
+            int cutoff = 0;
+            for (int i = 0; i < _unackedSentQueue.size(); i++) {
+                Segment s = _unackedSentQueue.get(i);
+                if (compareSequenceNumbers(s.seq(), lastInSequence) <= 0) {
                     s.markAcked();
                     s.clearBackOff();
                     removed++;
-                    continue;
+                    cutoff = i + 1;
                 }
+            }
 
-                for (int i = 0; i < acks.length; i++) {
-                    if ((compareSequenceNumbers(s.seq(), acks[i]) == 0)) {
-                        it.remove();
+            if (cutoff > 0) {
+                _unackedSentQueue.subList(0, cutoff).clear();
+            }
+
+            /* Remove scattered EAK acks from what remains (in reverse order) */
+            for (int i = _unackedSentQueue.size() - 1; i >= 0; i--) {
+                Segment s = _unackedSentQueue.get(i);
+                for (int j = 0; j < acks.length; j++) {
+                    if (compareSequenceNumbers(s.seq(), acks[j]) == 0) {
+                        _unackedSentQueue.remove(i);
                         s.markAcked();
                         s.clearBackOff();
                         removed++;
@@ -2068,20 +2088,30 @@ public class ReliableSocket extends Socket
             int removed = 0;
             int ackedData = 0;
 
-            Iterator<Segment> it = _unackedSentQueue.iterator();
-            while (it.hasNext()) {
-                Segment s = (Segment) it.next();
+            /*
+             * ACK is cumulative: every segment with seq <= ackn is acknowledged.
+             * The prefix is cleared in one subList().clear() call (O(k) instead
+             * of O(n²) iterator.remove() on an ArrayList).  Scattered EAK acks
+             * after the prefix are removed individually in reverse-index order
+             * so array shifts are always from the tail.
+             */
+            int cutoff = 0;
+            for (int i = 0; i < _unackedSentQueue.size(); i++) {
+                Segment s = _unackedSentQueue.get(i);
                 if (compareSequenceNumbers(s.seq(), ackn) <= 0) {
-                    it.remove();
                     s.markAcked();
                     s.clearBackOff();
                     newestAcked = s;
                     removed++;
-
                     if (s instanceof DATSegment) {
                         ackedData++;
                     }
+                    cutoff = i + 1;
                 }
+            }
+
+            if (cutoff > 0) {
+                _unackedSentQueue.subList(0, cutoff).clear();
             }
 
             _counters.decOutstandingSegsCounter(removed);

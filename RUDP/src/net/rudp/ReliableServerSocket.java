@@ -320,6 +320,31 @@ public class ReliableServerSocket extends ServerSocket
     }
 
     /**
+     * Atomically checks whether a route exists for the endpoint and,
+     * if not, registers the given sink.  Returns true if a route was
+     * already present (the caller must not overwrite it); returns false
+     * on success (this sink is now the route).
+     *
+     * Combines checkRoute + registerRoute into a single lock acquisition
+     * so that no other thread can slip in between and register a
+     * different sink — the race window that let a SYN-ACK be routed to
+     * a stale socket before the connect() call finished.
+     *
+     * @param endpoint the remote peer address (IP + port).
+     * @param sink     the segment sink to register if absent.
+     * @return true if a route already existed (sink was NOT registered).
+     */
+    public boolean registerRouteIfAbsent(SocketAddress endpoint, PacketSink sink) {
+        synchronized (_clientSockTable) {
+            if (_clientSockTable.containsKey(endpoint)) {
+                return true;
+            }
+            _clientSockTable.put(endpoint, sink);
+            return false;
+        }
+    }
+
+    /**
      * Registers a new client socket with the specified endpoint address.
      *
      * @param endpoint    the new socket.
@@ -419,9 +444,7 @@ public class ReliableServerSocket extends ServerSocket
 
                         if (!isClosed()) {
                             if (s instanceof SYNSegment) {
-                                if (!_clientSockTable.containsKey(endpoint)) {
-                                    sock = addClientSocket(endpoint);
-                                }
+                                addClientSocket(endpoint);
                             }
                         }
 

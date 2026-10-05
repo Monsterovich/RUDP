@@ -211,14 +211,12 @@ public class MultiplexedReliableSocket extends ReliableSocket implements PacketS
         _connectEndpoint = endpoint;
 
         if (_serverSocket != null && endpoint != null) {
-            if (_serverSocket.checkRoute(endpoint)) {
+            if (_serverSocket.registerRouteIfAbsent(endpoint, this)) {
                 destroyTimers();
                 closeSocket();
                 removeShutdownHook();
                 throw new IOException("Already connected");
             }
-            // Register before sending SYN to avoid race with incoming SYN-ACK
-            _serverSocket.registerRoute(endpoint, this);
         }
         try {
             super.connect(endpoint, timeout);
