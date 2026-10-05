@@ -228,7 +228,7 @@ public class ReliableSocket extends Socket
      *
      * @param sock the datagram socket.
      * @param profile the socket profile.
-     * @param clock the source of wall clock time.
+     * @param clock the source of the time timestamps are taken from.
      */
     protected ReliableSocket(DatagramSocket sock, ReliableSocketProfile profile, Clock clock)
     {
@@ -1720,9 +1720,11 @@ public class ReliableSocket extends Socket
                      * Allow it anyway if the segment's deadline passed
                      * (previous retransmit timed out). */
                     int rto = _rto.rto();
-                    boolean withinRtoWindow = (nowMillis - _eakLastRetxTime < rto);
+                    boolean withinRtoWindow = _eakRetxValid
+                            && (nowMillis - _eakLastRetxTime < rto);
                     if (!withinRtoWindow || eakMayRetransmit(s, nowMillis)) {
                         _eakLastRetxTime = nowMillis;
+                        _eakRetxValid = true;
 
                         try {
                             s.backOffRto(1); /* incremental backoff, +1 */
@@ -1744,7 +1746,7 @@ public class ReliableSocket extends Socket
              * a window's worth of loss produces a stream of EAKs, and
              * cutting on each of them halves the threshold once per
              * report rather than once per loss. */
-            if (_eakLastRetxTime > 0 && beginRecovery()) {
+            if (_eakRetxValid && beginRecovery()) {
                 _ssthresh = slowStartThresholdAfterLoss();
                 _cwnd = Math.min(_ssthresh, congestionWindowCap());
                 _congState = CONG_AVOIDANCE;
@@ -2431,6 +2433,13 @@ public class ReliableSocket extends Socket
 
     /**
      * Returns this socket's current time, i.e. the injected clock's reading.
+     * <p>
+     * Used for everything the socket measures rather than reports: the
+     * instant a segment went out, the deadline it is due at, and the round
+     * trip an acknowledgment closes. All three are differences between two
+     * readings of the same clock, which is why the clock has to be monotonic
+     * - Clock.SYSTEM is, and a reading that jumped would show up here as a
+     * round trip of impossible length and as deadlines that never expire.
      *
      * @return the current time in milliseconds.
      */
@@ -2476,8 +2485,8 @@ public class ReliableSocket extends Socket
     protected ReliableSocketOutputStream _out;
 
     /*
-     * Every wall clock reading of this socket goes through _clock, so a test
-     * can install a clock it advances by hand and drive the retransmission
+     * Every timestamp of this socket goes through _clock, so a test can
+     * install a clock it advances by hand and drive the retransmission
      * schedule deterministically instead of sleeping on the real one.
      */
     private Clock _clock = Clock.SYSTEM;
@@ -2551,8 +2560,17 @@ public class ReliableSocket extends Socket
     private boolean _dupAckValid = false;
 
     /* EAK backoff throttle: per-RTO guard so EAK-driven retransmit
-     * does not fire more than once per estimated RTT. */
-    private long _eakLastRetxTime = 0;
+     * does not fire more than once per estimated RTT.
+     *
+     * _eakRetxValid says whether _eakLastRetxTime has ever been stamped,
+     * rather than leaving the stamp to start at zero and be read back as
+     * "not yet". The clock's origin is arbitrary and may be negative or
+     * near it, so a reading of zero can arrive before the first EAK has
+     * fired and be indistinguishable from the initial value - which would
+     * throttle the very first EAK retransmit and, since the same reading
+     * gates the window cut below, keep it from happening at all. */
+    private long    _eakLastRetxTime = 0;
+    private boolean _eakRetxValid    = false;
 
     /* ------------------------------------------------------------------
      * Congestion control (Reno-style).  The effective sending window is

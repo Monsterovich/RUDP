@@ -31,14 +31,18 @@
 package net.rudp;
 
 /**
- * Source of the wall clock time used by a socket to stamp transmission
- * instants, to compute retransmission deadlines and to enforce timeouts.
+ * Source of the time used by a socket to stamp transmission instants, to
+ * compute retransmission deadlines and to enforce timeouts.
  * <p>
  * Every timestamp a socket takes goes through this interface, so a test can
  * substitute a clock it advances by hand and decide exactly when a timeout
  * becomes due. Without that seam the retransmission logic can only be
  * exercised by sleeping, which makes a regression in the backoff schedule
  * indistinguishable from a slow machine.
+ * <p>
+ * Implementations are expected to be monotonic: the socket only ever takes
+ * differences, and a reading that goes backwards turns into a round trip
+ * sample of negative length or into a deadline that never comes due.
  */
 public interface Clock
 {
@@ -50,11 +54,31 @@ public interface Clock
      */
     long currentTimeMillis();
 
-    /** The real system clock, used by every socket unless one is injected. */
+    /**
+     * The real system clock, used by every socket unless one is injected.
+     * <p>
+     * Backed by System.nanoTime() rather than System.currentTimeMillis().
+     * The two differ in a way this clock cannot afford: the wall clock is
+     * adjusted, and a socket measures intervals across those adjustments.
+     * A step forward - an NTP correction, an operator setting the clock by
+     * hand - lands in a round trip sample as a large positive value and
+     * carries the RTO to its ceiling for as long as the smoothed estimate
+     * takes to come back down, so one clock correction stalls the connection
+     * for seconds. A step back - the hour a daylight saving transition takes
+     * away, or an NTP correction the other way - lands in the same sample as
+     * a negative value, and lands in every deadline already handed out as a
+     * subtraction that stays positive long after it should have expired, so
+     * nothing is retransmitted until the wall clock catches up.
+     * <p>
+     * System.nanoTime() has neither failure mode: its origin is arbitrary
+     * and undocumented but its differences are exact, which is all that is
+     * asked of it here. The division to milliseconds is the only cost, and
+     * it keeps the interface's unit.
+     */
     Clock SYSTEM = new Clock() {
         public long currentTimeMillis()
         {
-            return System.currentTimeMillis();
+            return System.nanoTime() / 1000000L;
         }
 
         public String toString()
