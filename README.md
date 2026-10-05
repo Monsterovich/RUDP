@@ -96,10 +96,22 @@ at `28ed965`).
 - **EAK hole recovery with backoff.** Explicit Acknowledgment gaps now retransmit only
   the first segment of a hole (not the entire hole), with incremental backoff between
   retries throttled to once per RTO.
-- **Reno-style congestion control.** Slow start (`cwnd += 1` per ACK), congestion avoidance
-  (`cwnd += 1/cwnd` per ACK), fast retransmit drops `cwnd` to 1, timeout drops to
-  `ssthresh = max(cwnd/2, 2)`. EAK recovery drops `cwnd = ssthresh` (not 1) to avoid
-  choking the send window. The effective send window is `min(maxOutstandingSegs, cwnd)`.
+- **Reno-style congestion control.** The window opens at 10 segments and grows in slow start
+  by the number of acknowledged data segments per ACK, capped at the peer's
+  `maxOutstandingSegs`, until `cwnd >= ssthresh` turns it into congestion avoidance, where
+  it adds one segment per round trip (`cwnd += 1/cwnd` per ACK, with a partial round trip
+  carried into the next one). Only data segments count towards it: the handshake and null
+  segments are acknowledged before the application has written anything at all. The
+  effective send window is `min(maxOutstandingSegs, cwnd)`, and it holds that many segments
+  in flight rather than one more.
+- **One cut per loss.** A loss sets `ssthresh = max(in-flight/2, 2)` - halved from the
+  flight rather than from a window that may sit far above it - and drops `cwnd` to it on
+  fast retransmit or EAK, rather than to 1, which would choke the send window; on timeout it
+  goes to 1 and back to slow start. However many signals report that one loss - timeouts
+  coming due in the same pass, one EAK per few out-of-order arrivals, a duplicate ACK chain
+  - the window is cut once, because a recovery point holds off further cuts until an
+  acknowledgment passes it. Duplicate ACKs are counted only when bare: a data segment's own
+  acknowledgment carries one too, and so does every extended acknowledgment.
 - **Injectable clock.** `ReliableSocket` accepts a `Clock` implementation via constructor,
   enabling deterministic testing of timeouts and retransmission logic.
 
