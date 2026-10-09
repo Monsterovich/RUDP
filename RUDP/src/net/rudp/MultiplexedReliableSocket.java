@@ -226,7 +226,7 @@ public class MultiplexedReliableSocket extends ReliableSocket implements PacketS
             removeShutdownHook();
             // If connection fails synchronously, remove the route we just added
             if (_serverSocket != null && endpoint != null) {
-                _serverSocket.unregisterRoute(endpoint);
+                _serverSocket.unregisterRoute(endpoint, this);
             }
             throw e;
         }
@@ -286,7 +286,7 @@ public class MultiplexedReliableSocket extends ReliableSocket implements PacketS
         private void cleanup()
         {
             if (_serverSocket != null && _connectEndpoint != null) {
-                _serverSocket.unregisterRoute(_connectEndpoint);
+                _serverSocket.unregisterRoute(_connectEndpoint, MultiplexedReliableSocket.this);
             }
             try {
                 close();

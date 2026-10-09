@@ -307,6 +307,20 @@ public class ReliableServerSocket extends ServerSocket
         }
     }
 
+    /** Removes the route only if it still belongs to the given sink. */
+    public void unregisterRoute(SocketAddress endpoint, PacketSink sink)
+    {
+        synchronized (_clientSockTable) {
+            if (_clientSockTable.get(endpoint) == sink) {
+                _clientSockTable.remove(endpoint);
+            }
+
+            if (_clientSockTable.isEmpty() && isClosed()) {
+                _serverSock.close();
+            }
+        }
+    }
+
     /**
      * Checks if there is a route registered for the specified endpoint.
      *
@@ -377,10 +391,13 @@ public class ReliableServerSocket extends ServerSocket
      * @param endpoint     the socket.
      * @return the deregistered socket.
      */
-    private PacketSink removeClientSocket(SocketAddress endpoint)
+    private PacketSink removeClientSocket(SocketAddress endpoint, PacketSink owner)
     {
         synchronized (_clientSockTable) {
-            PacketSink sock = _clientSockTable.remove(endpoint);
+            PacketSink sock = _clientSockTable.get(endpoint);
+            if (sock == owner) {
+                _clientSockTable.remove(endpoint);
+            }
 
             if (_clientSockTable.isEmpty()) {
                 if (isClosed()) {
@@ -572,7 +589,7 @@ public class ReliableServerSocket extends ServerSocket
         {
             // Remove client socket from the table of active connections.
             if (sock instanceof ReliableClientSocket) {
-                removeClientSocket(((ReliableClientSocket) sock).getEndpoint());
+                removeClientSocket(((ReliableClientSocket) sock).getEndpoint(), (ReliableClientSocket) sock);
             }
         }
 
@@ -585,7 +602,7 @@ public class ReliableServerSocket extends ServerSocket
             // removeClientSocket(null) would silently do nothing, leaving a
             // dead entry permanently stuck in _clientSockTable.
             if (sock instanceof ReliableClientSocket) {
-                removeClientSocket(((ReliableClientSocket) sock).getEndpoint());
+                removeClientSocket(((ReliableClientSocket) sock).getEndpoint(), (ReliableClientSocket) sock);
             }
         }
 
