@@ -347,15 +347,35 @@ public class ReliableSocket extends Socket
 
         // Wait for connection establishment (or timeout)
         boolean timedout = false;
+        long startTime = now();
+        /*
+         * Wait in a loop until the state actually changes. A single wait()
+         * was woken by any notification - including ones that say nothing
+         * about this connection - and then fell through to the switch below
+         * and reported "Connection refused" long before the timeout had a
+         * chance to run out. The real-time deadline bounds the loop even when
+         * the injected clock is frozen (as it is in the deterministic tests);
+         * the injected clock is still what decides SocketTimeoutException vs
+         * connection refused, so that contract is unchanged.
+         */
+        long deadline = (timeout == 0) ? 0 : System.currentTimeMillis() + timeout;
         synchronized (this) {
-            if (!isConnected()) {
+            while (!isConnected() && _state == SYN_SENT && !isClosed()) {
                 try {
                     if (timeout == 0) {
                         wait();
                     }
                     else {
-                        long startTime = now();
-                        wait(timeout);
+                        long remaining = deadline - System.currentTimeMillis();
+                        if (remaining <= 0) {
+                            if (now() - startTime >= timeout) {
+                                timedout = true;
+                            }
+                            break;
+                        }
+
+                        wait(remaining);
+
                         if (now() - startTime >= timeout) {
                             timedout = true;
                         }
@@ -517,6 +537,16 @@ public class ReliableSocket extends Socket
 
             synchronized (_recvQueueLock) {
                 _recvQueueLock.notify();
+            }
+
+            /*
+             * Release anyone parked in write() waiting for a reset to finish.
+             * The connection is gone, so they must wake and see that rather
+             * than wait for a handshake that will never come.
+             */
+            synchronized (_resetLock) {
+                _reset = false;
+                _resetLock.notifyAll();
             }
         }
     }
@@ -862,6 +892,17 @@ public class ReliableSocket extends Socket
 
         synchronized (_recvQueueLock) {
 
+            /*
+             * The SO_TIMEOUT deadline belongs to the whole read() call, so it
+             * is taken once here rather than inside the wait loop. Taking it
+             * per wait restarted the timeout on every notification, and an
+             * idle connection is notified regularly (checkRecvQueues() wakes
+             * the reader for each incoming null segment), so a read that
+             * should have timed out after the configured interval could stay
+             * blocked indefinitely.
+             */
+            long startTime = now();
+
             while (true) {
                 while (_inSeqRecvQueue.isEmpty()) {
 
@@ -882,8 +923,11 @@ public class ReliableSocket extends Socket
                             _recvQueueLock.wait();
                         }
                         else {
-                            long startTime = now();
-                            _recvQueueLock.wait(_timeout);
+                            long elapsed = now() - startTime;
+                            if (elapsed >= _timeout) {
+                                throw new SocketTimeoutException();
+                            }
+                            _recvQueueLock.wait(_timeout - elapsed);
                             if ((now() - startTime) >= _timeout) {
                                 throw new SocketTimeoutException();
                             }
@@ -1115,7 +1159,16 @@ public class ReliableSocket extends Socket
             long win = Math.min(_profile.maxOutstandingSegs(), _cwnd);
             while ((_unackedSentQueue.size() >= _sendQueueSize) ||
                    (_counters.getOutstandingSegsCounter() >= win)) {
-                if (!_connected) {
+                /*
+                 * Also abort on _closed, not only on _connected. close()
+                 * flips _closed and notifies this monitor, but never clears
+                 * _connected, so a writer parked here because the window is
+                 * full would otherwise wait forever. That is a deadlock when
+                 * the writer already holds _resetLock (see write()) and
+                 * close() then waits for that same monitor to release writers
+                 * parked on a reset.
+                 */
+                if (!_connected || _closed) {
                     throw new SocketException("Socket is closed");
                 }
                 try {
@@ -1607,6 +1660,17 @@ public class ReliableSocket extends Socket
 
             _state = CLOSED;
             _closed = true;
+
+            /*
+             * Like close(), a failure can occur while the application is
+             * trying to write after a peer has reset the connection. Without
+             * unblocking those threads they would wait for the next reset
+             * handshake forever.
+             */
+            synchronized (_resetLock) {
+                _reset = false;
+                _resetLock.notifyAll();
+            }
         }
 
         synchronized (_stateListeners) {
@@ -1860,19 +1924,6 @@ public class ReliableSocket extends Socket
     private void handleSegment(Segment segment)
     {
         /*
-         * When a RST segment is received, the sender must stop
-         * sending new packets, but most continue to attempt
-         * delivery of packets already accepted from the application.
-         */
-        if (segment instanceof RSTSegment) {
-            synchronized (_resetLock) {
-                _reset = true;
-            }
-
-            connectionReset();
-        }
-
-        /*
          * When a FIN segment is received, no more packets
          * are expected to arrive after this segment.
          */
@@ -1891,6 +1942,16 @@ public class ReliableSocket extends Socket
         }
 
         boolean inSequence = false;
+        /*
+         * Whether the segment's sequence number was accepted into one of the
+         * receive queues. A control segment (RST) is acted upon only when it
+         * was: a datagram with a number outside the receive window is not
+         * evidence that the peer reset the connection, and honouring it - as
+         * the old code did, before any sequence check - let one stray RST
+         * trip _reset and park every writer on the socket for good, since
+         * only a fresh handshake ever cleared the flag.
+         */
+        boolean acceptable = false;
         synchronized (_recvQueueLock) {
 
             if (compareSequenceNumbers(segment.seq(), _counters.getLastInSequence()) <= 0) {
@@ -1900,6 +1961,7 @@ public class ReliableSocket extends Socket
                 inSequence = true;
                 if (_inSeqRecvQueue.size() == 0 || (_inSeqRecvQueue.size() + _outSeqRecvQueue.size() < _recvQueueSize)) {
                     /* Insert in-sequence segment */
+                    acceptable = true;
                     _counters.setLastInSequence(segment.seq());
                     if (segment instanceof DATSegment || segment instanceof RSTSegment || segment instanceof FINSegment) {
                         _inSeqRecvQueue.add(segment);
@@ -1923,6 +1985,7 @@ public class ReliableSocket extends Socket
             }
             else if (_inSeqRecvQueue.size() + _outSeqRecvQueue.size() < _recvQueueSize) {
                 /* Insert out-of-sequence segment, in order */
+                acceptable = true;
                 boolean added = false;
                 for (int i = 0; i < _outSeqRecvQueue.size() && !added; i++) {
                     Segment s = (Segment) _outSeqRecvQueue.get(i);
@@ -1974,6 +2037,22 @@ public class ReliableSocket extends Socket
                     }
                 }
             }
+        }
+
+        /*
+         * When a RST segment is received, the sender must stop sending new
+         * packets, but may continue to attempt delivery of packets already
+         * accepted from the application. This is done only after the sequence
+         * check above has accepted the segment, and outside the receive-queue
+         * lock so the listener callback cannot deadlock against it.
+         */
+        if (acceptable && segment instanceof RSTSegment) {
+            synchronized (_resetLock) {
+                _reset = true;
+                _resetLock.notifyAll();
+            }
+
+            connectionReset();
         }
     }
 

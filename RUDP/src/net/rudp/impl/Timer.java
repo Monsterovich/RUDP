@@ -40,7 +40,13 @@ public class Timer extends Thread
         _task = task;
         _delay = 0;
         _period = 0;
-        start();
+        /*
+         * The thread is started lazily by the first schedule() call rather
+         * than here. A ReliableSocket owns four timers; a socket that is
+         * created to answer a SYN and never completes the handshake would
+         * otherwise pay for four native threads it may never use, which is
+         * what lets a SYN flood exhaust the thread limit.
+         */
     }
 
     public void run()
@@ -143,6 +149,17 @@ public class Timer extends Thread
         }
 
         _scheduled = true;
+
+        /*
+         * First arming is also the first use, so this is where the thread is
+         * born. It blocks on this monitor until schedule() returns (the
+         * method is synchronized), then sees _scheduled and runs normally.
+         */
+        if (!_started) {
+            _started = true;
+            start();
+        }
+
         notify();
 
         synchronized (_lock) {
@@ -191,5 +208,6 @@ public class Timer extends Thread
     private boolean  _scheduled;
     private boolean  _reset;
     private boolean  _stopped;
+    private boolean  _started;
     private Object   _lock = new Object();
 }

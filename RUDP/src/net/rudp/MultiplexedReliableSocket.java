@@ -33,6 +33,7 @@ package net.rudp;
 import java.io.IOException;
 import java.net.DatagramSocket;
 import java.net.SocketAddress;
+import java.net.SocketException;
 import java.util.ArrayDeque;
 
 import net.rudp.impl.Segment;
@@ -204,6 +205,32 @@ public class MultiplexedReliableSocket extends ReliableSocket implements PacketS
      */
     public void connect(SocketAddress endpoint, int timeout) throws IOException
     {
+        /*
+         * The checks ReliableSocket.connect() makes must be repeated here and,
+         * crucially, run BEFORE this override's side effects. A second
+         * connect() on a live socket has to fail with "already connected" and
+         * leave the connection untouched; the route-conflict path below used
+         * to call destroyTimers() and closeSocket() first, which killed the
+         * reader thread of a perfectly healthy connection (the peer then died
+         * on keep-alive). Mirror the order of ReliableSocket so the same
+         * exceptions are reported for the same inputs.
+         */
+        if (endpoint == null) {
+            throw new IllegalArgumentException("connect: The address can't be null");
+        }
+
+        if (timeout < 0) {
+            throw new IllegalArgumentException("connect: timeout can't be negative");
+        }
+
+        if (isClosed()) {
+            throw new SocketException("Socket is closed");
+        }
+
+        if (isConnected()) {
+            throw new SocketException("already connected");
+        }
+
         // Cached separately from getRemoteSocketAddress(), because that method
         // returns null once the socket is no longer "connected" (e.g. after
         // connectionFailure() flips internal state) - exactly when the cleanup
@@ -212,6 +239,10 @@ public class MultiplexedReliableSocket extends ReliableSocket implements PacketS
 
         if (_serverSocket != null && endpoint != null) {
             if (_serverSocket.registerRouteIfAbsent(endpoint, this)) {
+                // A live socket already owns this endpoint. The guards above
+                // catch the common case (this very socket already connected);
+                // here it is some other sink, so this connect attempt fails and
+                // its reader thread is released.
                 destroyTimers();
                 closeSocket();
                 removeShutdownHook();

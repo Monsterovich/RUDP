@@ -43,6 +43,7 @@ import java.net.SocketTimeoutException;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 
 import net.rudp.impl.SYNSegment;
 import net.rudp.impl.Segment;
@@ -161,14 +162,26 @@ public class ReliableServerSocket extends ServerSocket
         }
 
         synchronized (_backlog) {
+            /*
+             * The deadline is taken once for the whole accept() call. Computing
+             * it inside the loop restarted the timeout on every notification,
+             * so a peer that keeps producing events - or a stray segment that
+             * wakes the reader - could postpone the timeout for as long as it
+             * liked.
+             */
+            long startTime = System.currentTimeMillis();
+
             while (_backlog.isEmpty()) {
                 try {
                     if (_timeout == 0) {
                         _backlog.wait();
                     }
                     else {
-                        long startTime = System.currentTimeMillis();
-                        _backlog.wait(_timeout);
+                        long elapsed = System.currentTimeMillis() - startTime;
+                        if (elapsed >= _timeout) {
+                            throw new SocketTimeoutException();
+                        }
+                        _backlog.wait(_timeout - elapsed);
                         if (System.currentTimeMillis() - startTime >= _timeout) {
                             throw new SocketTimeoutException();
                         }
@@ -184,7 +197,15 @@ public class ReliableServerSocket extends ServerSocket
                 }
             }
 
-            return (Socket) _backlog.remove(0);
+            Socket accepted = (Socket) _backlog.remove(0);
+            /*
+             * Wake a connectionOpened() waiting for room in a full backlog.
+             * Without this the blocked reader thread stayed parked forever,
+             * so connections it had already established were never delivered
+             * even after the queue drained.
+             */
+            _backlog.notify();
+            return accepted;
         }
     }
 
@@ -370,10 +391,23 @@ public class ReliableServerSocket extends ServerSocket
             PacketSink sock = _clientSockTable.get(endpoint);
 
             if (sock == null) {
+                /*
+                 * No candidate yet. Refuse to create one if the table of
+                 * half-open sockets is already at its cap: dropping the SYN
+                 * costs nothing (the peer retransmits, and gives up on its
+                 * own), while allocating the socket would be the very thing
+                 * the flood is asking for. A null return makes the caller
+                 * drop this datagram.
+                 */
+                if (!admitSynRcvd(endpoint)) {
+                    return null;
+                }
+
                 try {
                     ReliableClientSocket clientSock = new ReliableClientSocket(_serverSock, endpoint);
                     clientSock.addStateListener(_stateListener);
                     _clientSockTable.put(endpoint, clientSock);
+                    registerSynRcvd(clientSock, endpoint);
                     sock = clientSock;
                 }
                 catch (IOException xcp) {
@@ -383,6 +417,82 @@ public class ReliableServerSocket extends ServerSocket
 
             return sock;
         }
+    }
+
+    /**
+     * Whether a new half-open candidate may be created for the endpoint.
+     * Must be called while holding the _clientSockTable monitor.
+     */
+    private boolean admitSynRcvd(SocketAddress endpoint)
+    {
+        if (_synRcvdCount >= MAX_SYN_RCVD_SOCKETS) {
+            return false;
+        }
+
+        InetAddress ip = endpointAddress(endpoint);
+        if (ip != null) {
+            Integer n = _synRcvdByIp.get(ip);
+            if (n != null && n >= MAX_SYN_RCVD_PER_IP) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Records a freshly created candidate. Must be called while holding the
+     * _clientSockTable monitor.
+     */
+    private void registerSynRcvd(PacketSink sock, SocketAddress endpoint)
+    {
+        _synRcvdSocks.add(sock);
+        _synRcvdCount++;
+
+        InetAddress ip = endpointAddress(endpoint);
+        if (ip != null) {
+            Integer n = _synRcvdByIp.get(ip);
+            _synRcvdByIp.put(ip, (n == null) ? 1 : n + 1);
+        }
+    }
+
+    /**
+     * Releases a candidate once it is established or has died. Harmless if
+     * the socket was never pending, which is the case for a connection that
+     * is reset and reopens - it is then already accounted as established.
+     * Must be called while holding the _clientSockTable monitor.
+     */
+    private void releaseSynRcvd(PacketSink sock, SocketAddress endpoint)
+    {
+        if (!_synRcvdSocks.remove(sock)) {
+            return;
+        }
+
+        if (_synRcvdCount > 0) {
+            _synRcvdCount--;
+        }
+
+        InetAddress ip = endpointAddress(endpoint);
+        if (ip != null) {
+            Integer n = _synRcvdByIp.get(ip);
+            if (n != null) {
+                if (n <= 1) {
+                    _synRcvdByIp.remove(ip);
+                }
+                else {
+                    _synRcvdByIp.put(ip, n - 1);
+                }
+            }
+        }
+    }
+
+    private static InetAddress endpointAddress(SocketAddress endpoint)
+    {
+        if (endpoint instanceof InetSocketAddress) {
+            return ((InetSocketAddress) endpoint).getAddress();
+        }
+
+        return null;
     }
 
     /**
@@ -426,9 +536,33 @@ public class ReliableServerSocket extends ServerSocket
      */
     private HashMap<SocketAddress, PacketSink>   _clientSockTable;
 
+    /*
+     * Half-open (SYN_RCVD) accounting, used to bound how many incoming
+     * candidates a SYN flood may force this server to allocate before the
+     * handshake completes. A candidate is created on the SYN and released as
+     * soon as it is established or dies, so the cap counts only sockets that
+     * are neither usable yet nor finished. Both a global and a per-IP limit
+     * are kept: the global one bounds the process, the per-IP one keeps a
+     * single source from consuming the whole budget. Guarded by
+     * _clientSockTable.
+     */
+    private final HashMap<InetAddress, Integer> _synRcvdByIp = new HashMap<InetAddress, Integer>();
+    private final HashSet<PacketSink>           _synRcvdSocks = new HashSet<PacketSink>();
+    private int _synRcvdCount;
+
     private ReliableSocketStateListener _stateListener;
 
     private static final int DEFAULT_BACKLOG_SIZE = 50;
+
+    /*
+     * Caps on sockets still in SYN_RCVD. A candidate costs at least one
+     * reader thread while it waits for its ACK, so an unanswered SYN flood
+     * used to grow the thread count without bound until the process ran out
+     * of native threads or memory. These are deliberately not derived from
+     * the peer's SYN: a remote peer must not be able to raise its own limit.
+     */
+    private static final int MAX_SYN_RCVD_SOCKETS = 256;
+    private static final int MAX_SYN_RCVD_PER_IP  = 64;
 
     private class ReceiverThread extends Thread
     {
@@ -448,6 +582,27 @@ public class ReliableServerSocket extends ServerSocket
 
                 try {
                     _serverSock.receive(packet);
+                }
+                catch (IOException xcp) {
+                    if (isClosed()) {
+                        break;
+                    }
+                    xcp.printStackTrace();
+                    continue;
+                }
+
+                /*
+                 * The processing of a single datagram is isolated from the
+                 * receive loop. This thread is the only reader for every
+                 * connection sharing this port, so anything thrown while
+                 * handling one packet - a malformed segment, a sink that
+                 * throws, an allocation failure under load - used to kill the
+                 * dispatcher and stop the port accepting connections for
+                 * good, while the sockets it had already opened stayed
+                 * nominally alive. Dropping the packet is the failure that
+                 * affects the least: the peer retransmits it.
+                 */
+                try {
                     SocketAddress endpoint = packet.getSocketAddress();
                     Segment s;
                     try {
@@ -472,11 +627,8 @@ public class ReliableServerSocket extends ServerSocket
                         sock.segmentReceived(s);
                     }
                 }
-                catch (IOException xcp) {
-                    if (isClosed()) {
-                        break;
-                    }
-                    xcp.printStackTrace();
+                catch (Throwable t) {
+                    t.printStackTrace();
                 }
             }
         }
@@ -564,8 +716,25 @@ public class ReliableServerSocket extends ServerSocket
         public void connectionOpened(ReliableSocket sock)
         {
             if (sock instanceof ReliableClientSocket) {
+                ReliableClientSocket client = (ReliableClientSocket) sock;
+
+                /*
+                 * The handshake completed, so this candidate is no longer
+                 * half-open and its slot in the SYN_RCVD budget is returned.
+                 */
+                synchronized (_clientSockTable) {
+                    releaseSynRcvd(client, client.getEndpoint());
+                }
+
                 synchronized (_backlog) {
-                    while (_backlog.size() > DEFAULT_BACKLOG_SIZE) {
+                    /*
+                     * Wait only while the queue is at the configured backlog
+                     * size, and accept() notifies on every removal. The size
+                     * is the one passed to the constructor rather than the
+                     * hard-coded default: a caller that raised or lowered the
+                     * backlog was otherwise ignored.
+                     */
+                    while (_backlog.size() >= _backlogSize) {
                         try {
                             _backlog.wait();
                         }
@@ -589,7 +758,11 @@ public class ReliableServerSocket extends ServerSocket
         {
             // Remove client socket from the table of active connections.
             if (sock instanceof ReliableClientSocket) {
-                removeClientSocket(((ReliableClientSocket) sock).getEndpoint(), (ReliableClientSocket) sock);
+                ReliableClientSocket client = (ReliableClientSocket) sock;
+                synchronized (_clientSockTable) {
+                    releaseSynRcvd(client, client.getEndpoint());
+                }
+                removeClientSocket(client.getEndpoint(), client);
             }
         }
 
@@ -602,7 +775,11 @@ public class ReliableServerSocket extends ServerSocket
             // removeClientSocket(null) would silently do nothing, leaving a
             // dead entry permanently stuck in _clientSockTable.
             if (sock instanceof ReliableClientSocket) {
-                removeClientSocket(((ReliableClientSocket) sock).getEndpoint(), (ReliableClientSocket) sock);
+                ReliableClientSocket client = (ReliableClientSocket) sock;
+                synchronized (_clientSockTable) {
+                    releaseSynRcvd(client, client.getEndpoint());
+                }
+                removeClientSocket(client.getEndpoint(), client);
             }
         }
 
