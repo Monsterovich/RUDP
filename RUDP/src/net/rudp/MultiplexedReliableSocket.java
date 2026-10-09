@@ -136,7 +136,8 @@ public class MultiplexedReliableSocket extends ReliableSocket implements PacketS
                     _queue.wait();
                 }
                 catch (InterruptedException xcp) {
-                    xcp.printStackTrace();
+                    Thread.currentThread().interrupt();
+                    return null;
                 }
             }
 

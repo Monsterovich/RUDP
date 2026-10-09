@@ -359,6 +359,7 @@ public class ReliableSocket extends Socket
          * connection refused, so that contract is unchanged.
          */
         long deadline = (timeout == 0) ? 0 : System.currentTimeMillis() + timeout;
+        boolean interrupted = false;
         synchronized (this) {
             while (!isConnected() && _state == SYN_SENT && !isClosed()) {
                 try {
@@ -382,7 +383,9 @@ public class ReliableSocket extends Socket
                     }
                 }
                 catch (InterruptedException xcp) {
-                    xcp.printStackTrace();
+                    interrupted = true;
+                    Thread.currentThread().interrupt();
+                    break;
                 }
             }
         }
@@ -404,6 +407,9 @@ public class ReliableSocket extends Socket
                 removeShutdownHook();
                 connectionRefused();
                 _state = CLOSED;
+                if (interrupted) {
+                    throw new InterruptedIOException("connect interrupted");
+                }
                 if (timedout) {
                     throw new SocketTimeoutException();
                 }
@@ -512,6 +518,15 @@ public class ReliableSocket extends Socket
 
             switch (_state) {
                 case SYN_SENT:
+                    /*
+                     * A connect() that is still in flight owns timers and
+                     * (through the reader thread) the socket just like a
+                     * connected one does, and nothing else will take them
+                     * down once connect() drops its wait. closeImpl() is not
+                     * used here because there is no handshake to wait out.
+                     */
+                    destroyTimers();
+                    closeSocket();
                     synchronized (this) {
                         notify();
                     }
@@ -779,11 +794,22 @@ public class ReliableSocket extends Socket
             // Wait to flush all outstanding segments (including last RST segment).
             synchronized (_unackedSentQueue) {
                 while (!_unackedSentQueue.isEmpty()) {
+                    /*
+                     * Nothing ever moves the unacknowledged queue once the
+                     * connection is gone: close() notifies it but never clears
+                     * it, so a reset() parked here after a close() or a
+                     * connection failure would wait for a flush that can no
+                     * longer happen. The connection exiting is that flush.
+                     */
+                    if (_closed || !_connected) {
+                        throw new SocketException("Socket is closed");
+                    }
                     try {
                         _unackedSentQueue.wait();
                     }
                     catch (InterruptedException xcp) {
-                        xcp.printStackTrace();
+                        Thread.currentThread().interrupt();
+                        throw new InterruptedIOException("reset interrupted");
                     }
                 }
             }
@@ -848,7 +874,8 @@ public class ReliableSocket extends Socket
                         _resetLock.wait();
                     }
                     catch (InterruptedException xcp) {
-                        xcp.printStackTrace();
+                        Thread.currentThread().interrupt();
+                        throw new InterruptedIOException("write interrupted");
                     }
                 }
 
@@ -934,6 +961,7 @@ public class ReliableSocket extends Socket
                         }
                     }
                     catch (InterruptedException xcp) {
+                        Thread.currentThread().interrupt();
                     	if(!_closed)
                     		throw new InterruptedIOException(xcp.getMessage());
                     }
@@ -1022,6 +1050,21 @@ public class ReliableSocket extends Socket
     }
 
     /**
+     * A copy of the registered data listeners, taken under the listener
+     * monitor and returned for invocation outside it. A listener callback
+     * that registers or removes a listener must not wait on a monitor this
+     * notification thread is still holding.
+     *
+     * @return the registered listeners.
+     */
+    private ReliableSocketListener[] snapshotListeners()
+    {
+        synchronized (_listeners) {
+            return _listeners.toArray(new ReliableSocketListener[_listeners.size()]);
+        }
+    }
+
+    /**
      * Adds the specified state listener to this socket. If the listener
      * has already been registered, this method does nothing.
      *
@@ -1055,6 +1098,21 @@ public class ReliableSocket extends Socket
          synchronized (_stateListeners) {
             _stateListeners.remove(stateListener);
          }
+    }
+
+    /**
+     * A copy of the registered state listeners, taken under the listener
+     * monitor and returned for invocation outside it. A callback that
+     * registers or removes a listener - or that drives this socket - must
+     * not run while this monitor is held.
+     *
+     * @return the registered state listeners.
+     */
+    private ReliableSocketStateListener[] snapshotStateListeners()
+    {
+        synchronized (_stateListeners) {
+            return _stateListeners.toArray(new ReliableSocketStateListener[_stateListeners.size()]);
+        }
     }
 
     /**
@@ -1175,7 +1233,8 @@ public class ReliableSocket extends Socket
                     _unackedSentQueue.wait();
                 }
                 catch (InterruptedException xcp) {
-                    xcp.printStackTrace();
+                    Thread.currentThread().interrupt();
+                    throw new InterruptedIOException("send interrupted");
                 }
             }
 
@@ -1399,13 +1458,10 @@ public class ReliableSocket extends Socket
         }
 
         if (segment instanceof DATSegment) {
-             synchronized (_listeners) {
-                 Iterator<ReliableSocketListener> it = _listeners.iterator();
-                 while (it.hasNext()) {
-                     ReliableSocketListener l = (ReliableSocketListener) it.next();
-                     l.packetRetransmitted();
-                 }
-             }
+            ReliableSocketListener[] listeners = snapshotListeners();
+            for (int i = 0; i < listeners.length; i++) {
+                listeners[i].packetRetransmitted();
+            }
         }
 
         return false;
@@ -1574,12 +1630,9 @@ public class ReliableSocket extends Socket
                 notify();
             }
 
-            synchronized (_stateListeners) {
-                Iterator<ReliableSocketStateListener> it = _stateListeners.iterator();
-                while (it.hasNext()) {
-                    ReliableSocketStateListener l = (ReliableSocketStateListener) it.next();
-                    l.connectionOpened(this);
-                }
+            ReliableSocketStateListener[] listeners = snapshotStateListeners();
+            for (int i = 0; i < listeners.length; i++) {
+                listeners[i].connectionOpened(this);
             }
         }
 
@@ -1598,12 +1651,9 @@ public class ReliableSocket extends Socket
      */
     private void connectionRefused()
     {
-        synchronized (_stateListeners) {
-            Iterator<ReliableSocketStateListener> it = _stateListeners.iterator();
-            while (it.hasNext()) {
-                ReliableSocketStateListener l = (ReliableSocketStateListener) it.next();
-                l.connectionRefused(this);
-            }
+        ReliableSocketStateListener[] listeners = snapshotStateListeners();
+        for (int i = 0; i < listeners.length; i++) {
+            listeners[i].connectionRefused(this);
         }
     }
 
@@ -1613,12 +1663,9 @@ public class ReliableSocket extends Socket
      */
     private void connectionClosed()
     {
-        synchronized (_stateListeners) {
-            Iterator<ReliableSocketStateListener> it = _stateListeners.iterator();
-            while (it.hasNext()) {
-                ReliableSocketStateListener l = (ReliableSocketStateListener) it.next();
-                l.connectionClosed(this);
-            }
+        ReliableSocketStateListener[] listeners = snapshotStateListeners();
+        for (int i = 0; i < listeners.length; i++) {
+            listeners[i].connectionClosed(this);
         }
     }
 
@@ -1638,6 +1685,15 @@ public class ReliableSocket extends Socket
 
             switch (_state) {
                 case SYN_SENT:
+                    /*
+                     * A connection attempt that never finished must still stop
+                     * its timers and release its socket, the way close() does
+                     * for a connected socket. Nothing else will: connect()
+                     * only wakes whoever was waiting for it, and this thread
+                     * runs on after that.
+                     */
+                    destroyTimers();
+                    closeSocket();
                     synchronized (this) {
                         notify();
                     }
@@ -1647,6 +1703,14 @@ public class ReliableSocket extends Socket
                 case ESTABLISHED:
                     _connected = false;
                     synchronized (_unackedSentQueue) {
+                        /*
+                         * Leave the queue empty for anyone waiting on it
+                         * (reset() in particular): an acknowledgment can no
+                         * longer arrive to drain it, so a waiter would only
+                         * see the notify, find the queue still full and wait
+                         * again - forever.
+                         */
+                        _unackedSentQueue.clear();
                         _unackedSentQueue.notifyAll();
                     }
 
@@ -1673,12 +1737,15 @@ public class ReliableSocket extends Socket
             }
         }
 
-        synchronized (_stateListeners) {
-            Iterator<ReliableSocketStateListener> it = _stateListeners.iterator();
-            while (it.hasNext()) {
-                ReliableSocketStateListener l = (ReliableSocketStateListener) it.next();
-                l.connectionFailure(this);
-            }
+        /*
+         * Listeners are notified from a snapshot taken outside their own
+         * monitor: a callback that registers or removes a listener while it
+         * runs cannot then wait on the monitor this notification is still
+         * holding.
+         */
+        ReliableSocketStateListener[] listeners = snapshotStateListeners();
+        for (int i = 0; i < listeners.length; i++) {
+            listeners[i].connectionFailure(this);
         }
     }
 
@@ -1688,12 +1755,9 @@ public class ReliableSocket extends Socket
      */
     private void connectionReset()
     {
-        synchronized (_stateListeners) {
-            Iterator<ReliableSocketStateListener> it = _stateListeners.iterator();
-            while (it.hasNext()) {
-                ReliableSocketStateListener l = (ReliableSocketStateListener) it.next();
-                l.connectionReset(this);
-            }
+        ReliableSocketStateListener[] listeners = snapshotStateListeners();
+        for (int i = 0; i < listeners.length; i++) {
+            listeners[i].connectionReset(this);
         }
     }
 
@@ -1719,9 +1783,14 @@ public class ReliableSocket extends Socket
                     _counters.setLastInSequence(segment.seq());
                     _state = SYN_RCVD;
 
-                    if (_keepAlive) {
-                        _keepAliveTimer.schedule(SYN_RCVD_TIMEOUT);
-                    }
+                    /*
+                     * The candidate is released if the handshake-completing
+                     * ACK never arrives. This fires regardless of the
+                     * keep-alive setting: a half-open connection that a
+                     * remote peer forces to linger must not depend on a local
+                     * policy flag to be cleaned up.
+                     */
+                    _keepAliveTimer.schedule(SYN_RCVD_TIMEOUT);
 
                     Random rand = new Random(now());
 
@@ -1924,25 +1993,6 @@ public class ReliableSocket extends Socket
     private void handleSegment(Segment segment)
     {
         /*
-         * When a FIN segment is received, no more packets
-         * are expected to arrive after this segment.
-         */
-        if (segment instanceof FINSegment) {
-            switch (_state) {
-                case SYN_SENT:
-                    synchronized (this) {
-                        notify();
-                    }
-                    break;
-                case CLOSED:
-                    break;
-                default:
-                    _state = CLOSE_WAIT;
-            }
-        }
-
-        boolean inSequence = false;
-        /*
          * Whether the segment's sequence number was accepted into one of the
          * receive queues. A control segment (RST) is acted upon only when it
          * was: a datagram with a number outside the receive window is not
@@ -1951,7 +2001,26 @@ public class ReliableSocket extends Socket
          * trip _reset and park every writer on the socket for good, since
          * only a fresh handshake ever cleared the flag.
          */
-        boolean acceptable = false;
+        boolean inSequence = false;
+        /*
+         * An accepted RST; set whenever this segment - or an earlier
+         * out-of-sequence RST that checkRecvQueues() just moved up into the
+         * in-sequence queue - belongs to the receive window. Reactive only
+         * then, never on a stray out-of-sequence one.
+         */
+        boolean resetReceived = false;
+        /*
+         * An accepted in-sequence FIN. When a FIN is received, no more
+         * packets are expected to arrive after this segment. The state
+         * transition is deliberately not done before the sequence check: a
+         * duplicate or out-of-window FIN must not send an established
+         * connection to CLOSE_WAIT, which would have it echo a FIN and tear
+         * the connection down for no reason at all.
+         */
+        boolean finReceived = false;
+        boolean packetInOrder = false;
+        boolean packetOutOfOrder = false;
+
         synchronized (_recvQueueLock) {
 
             if (compareSequenceNumbers(segment.seq(), _counters.getLastInSequence()) <= 0) {
@@ -1961,31 +2030,43 @@ public class ReliableSocket extends Socket
                 inSequence = true;
                 if (_inSeqRecvQueue.size() == 0 || (_inSeqRecvQueue.size() + _outSeqRecvQueue.size() < _recvQueueSize)) {
                     /* Insert in-sequence segment */
-                    acceptable = true;
                     _counters.setLastInSequence(segment.seq());
                     if (segment instanceof DATSegment || segment instanceof RSTSegment || segment instanceof FINSegment) {
                         _inSeqRecvQueue.add(segment);
                     }
 
                     if (segment instanceof DATSegment) {
-                        synchronized (_listeners) {
-                            Iterator<ReliableSocketListener> it = _listeners.iterator();
-                            while (it.hasNext()) {
-                                ReliableSocketListener l = (ReliableSocketListener) it.next();
-                                l.packetReceivedInOrder();
-                            }
-                        }
+                        packetInOrder = true;
                     }
 
-                    checkRecvQueues();
+                    /*
+                     * An out-of-sequence RST or FIN that this in-sequence
+                     * arrival (or the segment itself, if it is the RST/FIN)
+                     * just brought in sequence is as much a reset/close as
+                     * one that arrived in order.
+                     */
+                    Segment moved = checkRecvQueues();
+                    if (moved instanceof RSTSegment) {
+                        resetReceived = true;
+                    }
+                    else if (moved instanceof FINSegment) {
+                        finReceived = true;
+                    }
+
+                    if (segment instanceof RSTSegment) {
+                        resetReceived = true;
+                    }
+                    else if (segment instanceof FINSegment) {
+                        finReceived = true;
+                    }
                 }
                 else {
                     /* Drop packet: queue is full. */
                 }
             }
-            else if (_inSeqRecvQueue.size() + _outSeqRecvQueue.size() < _recvQueueSize) {
+            else if ((_inSeqRecvQueue.size() + _outSeqRecvQueue.size() < _recvQueueSize) &&
+                     sequenceWithinWindow(segment.seq(), _counters.getLastInSequence())) {
                 /* Insert out-of-sequence segment, in order */
-                acceptable = true;
                 boolean added = false;
                 for (int i = 0; i < _outSeqRecvQueue.size() && !added; i++) {
                     Segment s = (Segment) _outSeqRecvQueue.get(i);
@@ -2007,14 +2088,11 @@ public class ReliableSocket extends Socket
                 _counters.incOutOfSequenceCounter();
 
                 if (segment instanceof DATSegment) {
-                    synchronized (_listeners) {
-                        Iterator<ReliableSocketListener> it = _listeners.iterator();
-                        while (it.hasNext()) {
-                            ReliableSocketListener l = (ReliableSocketListener) it.next();
-                            l.packetReceivedOutOfOrder();
-                        }
-                    }
+                    packetOutOfOrder = true;
                 }
+            }
+            else {
+                /* Drop packet: too far ahead of the receive window. */
             }
 
             if (inSequence && (segment instanceof RSTSegment ||
@@ -2040,13 +2118,35 @@ public class ReliableSocket extends Socket
         }
 
         /*
+         * Listeners are invoked here, outside the receive-queue lock: a
+         * callback that writes to (or otherwise drives) this socket must not
+         * run against a held _recvQueueLock.
+         */
+        if (packetInOrder) {
+            ReliableSocketListener[] listeners = snapshotListeners();
+            for (int i = 0; i < listeners.length; i++) {
+                listeners[i].packetReceivedInOrder();
+            }
+        }
+        else if (packetOutOfOrder) {
+            ReliableSocketListener[] listeners = snapshotListeners();
+            for (int i = 0; i < listeners.length; i++) {
+                listeners[i].packetReceivedOutOfOrder();
+            }
+        }
+
+        if (finReceived) {
+            _state = CLOSE_WAIT;
+        }
+
+        /*
          * When a RST segment is received, the sender must stop sending new
          * packets, but may continue to attempt delivery of packets already
          * accepted from the application. This is done only after the sequence
          * check above has accepted the segment, and outside the receive-queue
          * lock so the listener callback cannot deadlock against it.
          */
-        if (acceptable && segment instanceof RSTSegment) {
+        if (resetReceived) {
             synchronized (_resetLock) {
                 _reset = true;
                 _resetLock.notifyAll();
@@ -2341,9 +2441,16 @@ public class ReliableSocket extends Socket
     /**
      * Checks for in-sequence segments in the out-of-sequence queue
      * that can be moved to the in-sequence queue.
+     *
+     * @return an RST or FIN segment that the move brought in sequence, or
+     *         null if none did. The caller is expected to act on a returned
+     *         control segment only after releasing the <code>_recvQueueLock</code>
+     *         monitor.
      */
-    private void checkRecvQueues()
+    private Segment checkRecvQueues()
     {
+        Segment moved = null;
+
         synchronized (_recvQueueLock) {
             Iterator<Segment> it = _outSeqRecvQueue.iterator();
             while (it.hasNext()) {
@@ -2352,6 +2459,9 @@ public class ReliableSocket extends Socket
                     _counters.setLastInSequence(s.seq());
                     if (s instanceof DATSegment || s instanceof RSTSegment || s instanceof FINSegment) {
                         _inSeqRecvQueue.add(s);
+                        if (moved == null && (s instanceof RSTSegment || s instanceof FINSegment)) {
+                            moved = s;
+                        }
                     }
                     it.remove();
                 }
@@ -2359,6 +2469,8 @@ public class ReliableSocket extends Socket
 
             _recvQueueLock.notify();
         }
+
+        return moved;
     }
 
     /**
@@ -2581,7 +2693,7 @@ public class ReliableSocket extends Socket
                     Thread.sleep(_profile.nullSegmentTimeout() * 2);
                 }
                 catch (InterruptedException xcp) {
-                    xcp.printStackTrace();
+                    Thread.currentThread().interrupt();
                 }
 
                 _retransmissionTimer.destroy();
@@ -2650,6 +2762,36 @@ public class ReliableSocket extends Socket
         else {
             return -1;
         }
+    }
+
+    /**
+     * Whether a sequence number lies inside the receiver's window, i.e.
+     * strictly after <code>last</code> and no more than <code>window</code>
+     * sequence numbers ahead of it (counting around the 8-bit wraparound).
+     * <p>
+     * This is the receive-side companion of the transmit window: the peer is
+     * told, in the handshake, that at most <code>maxOutstandingSegs</code>
+     * segments may be in flight, so anything further ahead than that was sent
+     * either by a peer that has been desynchronized or by a datagram
+     * fabricated for it, and is dropped rather than buffered.
+     *
+     * @param seqn   the sequence number to test.
+     * @param last   the last in-sequence number received.
+     * @return true if the number is inside the window.
+     */
+    private boolean sequenceWithinWindow(int seqn, int last)
+    {
+        int window = _profile.maxOutstandingSegs();
+        if (window <= 0) {
+            return false;
+        }
+
+        int ahead = (seqn - last) % MAX_SEQUENCE_NUMBER;
+        if (ahead < 0) {
+            ahead += MAX_SEQUENCE_NUMBER;
+        }
+
+        return (ahead > 0) && (ahead <= window);
     }
 
     protected DatagramSocket       _sock;

@@ -60,7 +60,9 @@ public class Timer extends Thread
                         wait();
                     }
                     catch (InterruptedException xcp) {
-                        xcp.printStackTrace();
+                        Thread.currentThread().interrupt();
+                        _stopped = true;
+                        break;
                     }
                 }
 
@@ -89,7 +91,9 @@ public class Timer extends Thread
                         _lock.wait(_delay);
                     }
                     catch (InterruptedException xcp) {
-                        xcp.printStackTrace();
+                        Thread.currentThread().interrupt();
+                        _stopped = true;
+                        return;
                     }
                 }
 
@@ -114,7 +118,9 @@ public class Timer extends Thread
                             _lock.wait(_period);
                         }
                         catch (InterruptedException xcp) {
-                            xcp.printStackTrace();
+                            Thread.currentThread().interrupt();
+                            _stopped = true;
+                            return;
                         }
 
                         if (_canceled) {

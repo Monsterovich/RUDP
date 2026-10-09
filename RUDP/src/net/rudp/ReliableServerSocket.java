@@ -31,6 +31,7 @@
 package net.rudp;
 
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
@@ -154,6 +155,44 @@ public class ReliableServerSocket extends ServerSocket
         new ReceiverThread().start();
     }
 
+    /**
+     * Waits for the underlying socket to be bound before this thread waits
+     * for a datagram on it.
+     * <p>
+     * DatagramSocket.receive() holds the socket's own monitor for as long as
+     * it is parked. A server built on an unbound socket - the
+     * <code>new ReliableServerSocket(new DatagramSocket(), backlog)</code>
+     * form - starts this thread in the constructor, so without this barrier it
+     * would win the race against bind() and sit in receive() holding the
+     * monitor that bind() needs, blocking forever. A reader waiting here
+     * holds no socket monitor, so the bind can always get one, and the wait
+     * is bounded: a socket bound behind this monitor's back - by the
+     * application holding on to the DatagramSocket it passed in - is still
+     * picked up.
+     */
+    private void awaitSocketBound()
+    {
+        while (!_serverSock.isBound()) {
+            if (_serverSock.isClosed()) {
+                return;
+            }
+
+            synchronized (_bindLock) {
+                if (_serverSock.isBound()) {
+                    return;
+                }
+
+                try {
+                    _bindLock.wait(AWAIT_BOUND_POLL_MS);
+                }
+                catch (InterruptedException xcp) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }
+    }
+
     public Socket accept()
         throws IOException
     {
@@ -189,7 +228,8 @@ public class ReliableServerSocket extends ServerSocket
 
                 }
                 catch (InterruptedException xcp) {
-                    xcp.printStackTrace();
+                    Thread.currentThread().interrupt();
+                    throw new InterruptedIOException("accept interrupted");
                 }
 
                 if (isClosed()) {
@@ -202,9 +242,13 @@ public class ReliableServerSocket extends ServerSocket
              * Wake a connectionOpened() waiting for room in a full backlog.
              * Without this the blocked reader thread stayed parked forever,
              * so connections it had already established were never delivered
-             * even after the queue drained.
+             * even after the queue drained. notifyAll() rather than notify():
+             * the same monitor is shared with the accept() calls waiting for
+             * an empty backlog, and a single notify() could wake one of them
+             * instead, leaving an established connection stuck at the full
+             * queue it was about to make room in.
              */
-            _backlog.notify();
+            _backlog.notifyAll();
             return accepted;
         }
     }
@@ -223,6 +267,9 @@ public class ReliableServerSocket extends ServerSocket
         }
 
         _serverSock.bind(endpoint);
+        synchronized (_bindLock) {
+            _bindLock.notifyAll();
+        }
     }
 
     public synchronized void close()
@@ -234,11 +281,20 @@ public class ReliableServerSocket extends ServerSocket
         _closed = true;
         synchronized (_backlog) {
             _backlog.clear();
-            _backlog.notify();
+            _backlog.notifyAll();
         }
 
-        if (_clientSockTable.isEmpty()) {
-            _serverSock.close();
+        /*
+         * The table check has to happen under the table's own monitor: a
+         * connection that established and unregistered itself concurrently -
+         * removeClientSocket()/unregisterRoute() also close the socket, from
+         * under that lock - could otherwise race this decision and leave the
+         * socket open, or close it while a route is still being registered.
+         */
+        synchronized (_clientSockTable) {
+            if (_clientSockTable.isEmpty()) {
+                _serverSock.close();
+            }
         }
     }
 
@@ -522,7 +578,14 @@ public class ReliableServerSocket extends ServerSocket
     private DatagramSocket _serverSock;
     private int            _timeout;
     private int            _backlogSize;
-    private boolean        _closed;
+    private volatile boolean _closed;
+
+    /*
+     * Guards the moment the underlying socket becomes bound. The receiver
+     * thread waits on it (see awaitSocketBound()) and bind() releases it.
+     * Taken before the socket's own monitor, never the other way round.
+     */
+    private final Object   _bindLock = new Object();
 
     /*
      * The listen backlog queue.
@@ -555,6 +618,14 @@ public class ReliableServerSocket extends ServerSocket
     private static final int DEFAULT_BACKLOG_SIZE = 50;
 
     /*
+     * How long the receiver thread sleeps between checks for the underlying
+     * socket having been bound. It only ever waits before the first datagram
+     * is read, so a bound server never pays for it; on a socket that is never
+     * bound it only bounds how late the receiver notices a close().
+     */
+    private static final int AWAIT_BOUND_POLL_MS = 100;
+
+    /*
      * Caps on sockets still in SYN_RCVD. A candidate costs at least one
      * reader thread while it waits for its ACK, so an unanswered SYN flood
      * used to grow the thread count without bound until the process ran out
@@ -581,6 +652,7 @@ public class ReliableServerSocket extends ServerSocket
                 PacketSink sock = null;
 
                 try {
+                    awaitSocketBound();
                     _serverSock.receive(packet);
                 }
                 catch (IOException xcp) {
@@ -658,7 +730,8 @@ public class ReliableServerSocket extends ServerSocket
                         _queue.wait();
                     }
                     catch (InterruptedException xcp) {
-                        xcp.printStackTrace();
+                        Thread.currentThread().interrupt();
+                        return null;
                     }
                 }
 
@@ -732,19 +805,37 @@ public class ReliableServerSocket extends ServerSocket
                      * size, and accept() notifies on every removal. The size
                      * is the one passed to the constructor rather than the
                      * hard-coded default: a caller that raised or lowered the
-                     * backlog was otherwise ignored.
+                     * backlog was otherwise ignored. The loop also watches
+                     * for the server closing: a closed server never drains,
+                     * so a reader parked here would wait for room that will
+                     * never appear.
                      */
-                    while (_backlog.size() >= _backlogSize) {
+                    while (_backlog.size() >= _backlogSize && !isClosed()) {
                         try {
                             _backlog.wait();
                         }
                         catch (InterruptedException xcp) {
-                            xcp.printStackTrace();
+                            Thread.currentThread().interrupt();
+                            return;
                         }
                     }
 
+                    if (isClosed()) {
+                        /*
+                         * Nobody will ever accept() this connection, so it is
+                         * shut down again rather than left half-established.
+                         */
+                        try {
+                            client.close();
+                        }
+                        catch (IOException xcp) {
+                            // ignore.
+                        }
+                        return;
+                    }
+
                     _backlog.add(sock);
-                    _backlog.notify();
+                    _backlog.notifyAll();
                 }
             }
         }
