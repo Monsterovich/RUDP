@@ -2,6 +2,12 @@
 #
 # Compiles RUDP and runs the integration tests.
 #
+# Usage: ./run_tests.sh [--extra]
+#   --extra  also run the additional suites (server/API contracts, connection
+#            lifecycle, reordering, multiplexing, malformed input). Some of
+#            them deliberately provoke the library's error logging, so they are
+#            opt-in.
+#
 # The library is compiled with javac rather than ant: RUDP/build.xml sets
 # basedir="..", which resolves srcdir to a non-existent <repo>/src, so
 # "ant clean build" always fails. It used to fail silently here, because the
@@ -21,6 +27,16 @@
 # escalates to SIGKILL after a grace period for exactly that reason.
 
 set -e
+
+# Only --extra is understood; anything else is a mistake worth failing on
+# before a compile is spent on it.
+EXTRA=0
+for arg in "$@"; do
+    case "$arg" in
+        --extra) EXTRA=1 ;;
+        *) echo "unknown option: $arg" >&2; exit 2 ;;
+    esac
+done
 
 cd "$(dirname "$0")/.."
 
@@ -44,6 +60,21 @@ javac -nowarn -d "$OUT" $(find RUDP/src -name '*.java')
 # window does is read from the wire rather than raced against a real timer.
 TESTS="SegmentParseTest RtoEstimatorTest RetransmissionTest ConnectTest \
 CongestionControlTest SimpleClientServerTest MultiplexedClientServerTest DataTransferTest"
+
+# Extra suites, run only with --extra. They are layered on top of a live
+# loopback connection: the server and API contracts, the connection state
+# machine, the reordering and multiplexing paths, and finally the
+# malformed-input cases. They are kept out of the default run because a few of
+# them deliberately provoke the library's error logging (a caught exception
+# printed with a stack trace), which is part of what they test but would make
+# the default output dirty.
+EXTRA_TESTS="ProfileTest TimerTest SocketApiTest ServerSocketTest \
+ConnectionLifecycleTest ReceiveOrderingTest MultiplexingTest RobustnessTest"
+
+if [ $EXTRA -eq 1 ]; then
+    echo "Running the extra suites as well (--extra)..."
+    TESTS="$TESTS $EXTRA_TESTS"
+fi
 
 # Generous enough for the transfer tests, short enough to not be mistaken for a
 # run that is still working.
